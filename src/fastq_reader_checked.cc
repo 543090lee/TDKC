@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include "kseq.h"
 
+// KSEQ_INIT is imported from kseq by Heng Li
 
 KSEQ_INIT(gzFile, gzread)
 
