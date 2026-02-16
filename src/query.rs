@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Write, BufWriter};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-
+use std::fs::File;
 use anyhow::Result;
 use rayon::prelude::*;
-
 use crate::database::{AccessionRegistry, KmerDatabase};
 use crate::minimizer::MinimizerScanner;
 
@@ -16,6 +15,7 @@ pub struct QueryConfig {
     pub use_accessions: bool,
     pub is_paired: bool,
     pub coverage_threshold: f64,
+    pub output_prefix: String,
 }
 
 struct FastqRecord {
@@ -176,12 +176,14 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     // Write all output
     {
-        let mut stdout = io::BufWriter::new(io::stdout().lock());
+        let mut f = File::create(format!("{}.output", config.output_prefix))?;
+        let mut writer = io::BufWriter::new(f);
+
         let chunks = output_chunks.into_inner().unwrap();
         for chunk in chunks {
-            stdout.write_all(&chunk)?;
+            writer.write_all(&chunk)?;
         }
-        stdout.flush()?;
+        writer.flush()?;
     }
 
     let elapsed = start.elapsed();
@@ -189,7 +191,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let u = unclassified.load(Ordering::Relaxed);
     let total = c + u;
 
-    eprintln!("\nResult");
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", total);

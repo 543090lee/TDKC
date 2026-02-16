@@ -175,7 +175,6 @@ pub struct KmerDatabase {
     fingerprints: Vec<u16>,
     taxid_indices: Vec<u8>,
     index_to_taxid: Vec<u32>,
-    /// Optional accession tracking
     accessions: Option<CsrAccessions>,
 }
 

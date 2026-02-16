@@ -62,6 +62,9 @@ enum Commands {
 
         #[arg(short = 'c', long, default_value_t = 0.3)]
         coverage: f64,
+
+        #[arg(short = 'o', long)]
+        output_prefix: String,
     },
 }
 
@@ -96,6 +99,7 @@ fn main() -> anyhow::Result<()> {
             accession,
             paired,
             coverage,
+            output_prefix,
         } => {
             query::run_query(query::QueryConfig {
                 db_prefix: db,
@@ -104,6 +108,7 @@ fn main() -> anyhow::Result<()> {
                 use_accessions: accession,
                 is_paired: paired,
                 coverage_threshold: coverage, 
+                output_prefix: output_prefix
             })?;
         }
     }
