@@ -6,3 +6,7 @@ TODO: add an option/parameter where if you do --consensus/no-fp then when we bui
 Good idea
 
 We dont need to index every sequence in the fasta file. only the ones that have target kmers.
+
+make load and writing bulk, minimize write_all : loead is now fixed, maybe faster write
+
+i might be using 2x memory when loading Accession registry since it's making id_to_name and name_to_id. but i dont need name_to_id during query time.

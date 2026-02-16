@@ -14,6 +14,8 @@ pub struct QueryConfig {
     pub reads_file: String,
     pub threads: usize,
     pub use_accessions: bool,
+    pub is_paired: bool,
+    pub coverage_threshold: f64,
 }
 
 struct FastqRecord {
@@ -27,6 +29,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .build_global()
         .ok();
     let db = KmerDatabase::load(&config.db_prefix)?;
+    let coverage_threshold = config.coverage_threshold;
 
     // Load accession registry if available and requested
     let acc_path = format!("{}.accessions", config.db_prefix);
@@ -94,7 +97,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
             let coverage = valid_hits as f64 / max_k as f64;
 
-            if valid_hits == 0 || coverage < 0.3 {
+            if valid_hits == 0 || coverage < coverage_threshold {
                 local_output.push_str(&format!(
                     "U\t{}\t0\t{}\t0:0\n",
                     record.header,

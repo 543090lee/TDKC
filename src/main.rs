@@ -38,12 +38,13 @@ enum Commands {
 
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
+
         #[arg(long)]
         accession: bool,
+
     },
 
     Query {
-        /// Database prefix
         #[arg(short = 'd', long)]
         db: String,
 
@@ -55,6 +56,12 @@ enum Commands {
 
         #[arg(long)]
         accession: bool,
+
+        #[arg(long)]
+        paired: bool,
+
+        #[arg(short = 'c', long, default_value_t = 0.3)]
+        coverage: f64,
     },
 }
 
@@ -87,12 +94,16 @@ fn main() -> anyhow::Result<()> {
             reads,
             threads,
             accession,
+            paired,
+            coverage,
         } => {
             query::run_query(query::QueryConfig {
                 db_prefix: db,
                 reads_file: reads,
                 threads,
                 use_accessions: accession,
+                is_paired: paired,
+                coverage_threshold: coverage, 
             })?;
         }
     }

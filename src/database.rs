@@ -310,7 +310,6 @@ impl KmerDatabase {
     /// Load from disk.
     pub fn load(prefix: &str) -> Result<Self> {
         eprintln!("Loading database from {}", prefix);
-        let load_start = std::time::Instant::now();
 
         // Meta
         let (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc) = {
@@ -337,7 +336,6 @@ impl KmerDatabase {
         };
 
         // MPHF
-        let t = std::time::Instant::now();
         let mphf: Mphf<u64> = {
             let data = std::fs::read(format!("{}.mphf", prefix))
                 .context("Cannot read .mphf file")?;
@@ -345,7 +343,6 @@ impl KmerDatabase {
         };
 
         // Fingerprints
-        let t = std::time::Instant::now();
         let fingerprints = {
             let data = std::fs::read(format!("{}.fp", prefix))
                 .context("Cannot read .fp file")?;
@@ -356,7 +353,6 @@ impl KmerDatabase {
         };
 
         // TaxID indices
-        let t = std::time::Instant::now();
         let taxid_indices = {
             let mut f = File::open(format!("{}.taxid", prefix))
                 .context("Cannot open .taxid file")?;
@@ -366,7 +362,6 @@ impl KmerDatabase {
         };
 
         // TaxID mapping
-        let t = std::time::Instant::now();
         let index_to_taxid = {
             let data = std::fs::read(format!("{}.taxmap", prefix))
                 .context("Cannot read .taxmap file")?;
@@ -377,7 +372,6 @@ impl KmerDatabase {
                 .collect::<Vec<u32>>()
         };
 
-        let t = std::time::Instant::now();
         let acc_path = format!("{}.accession", prefix);
         let accessions = if has_acc && Path::new(&acc_path).exists() {
             Some(CsrAccessions::load(&acc_path)?)
