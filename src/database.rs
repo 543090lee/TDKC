@@ -14,8 +14,6 @@ fn compute_fingerprint(mut kmer: u64) -> u16 {
     (kmer & 0xFFFF) as u16
 }
 
-// ─── Accession Registry ─────────────────────────────────────────────────────
-
 /// Maps accession names ↔ compact u32 IDs.
 pub struct AccessionRegistry {
     name_to_id: HashMap<String, u32>,
@@ -87,11 +85,11 @@ impl AccessionRegistry {
 }
 
 
-/// Compressed Sparse Row storage for variable-length accession lists per minimizer.
+/// CSR storage for variable-length accession lists per minimizer
 pub struct CsrAccessions {
-    /// Offset into `data` for each minimizer index. Length = num_minimizers + 1.
+    /// Offset into `data` for each minimizer index. Length = num_minimizers + 1
     offsets: Vec<u32>,
-    /// Concatenated accession IDs.
+    /// Concatenated accession IDs
     data: Vec<u32>,
 }
 
@@ -145,28 +143,25 @@ impl CsrAccessions {
     }
 
     pub fn load(path: &str) -> Result<Self> {
-        let mut f = File::open(path).context("Cannot open CSR accession file")?;
+        let raw = std::fs::read(path).context("Cannot read CSR accession file")?;
 
-        let mut buf8 = [0u8; 8];
-        f.read_exact(&mut buf8)?;
-        let num_elements = u64::from_le_bytes(buf8) as usize;
-        f.read_exact(&mut buf8)?;
-        let data_len = u64::from_le_bytes(buf8) as usize;
+        let num_elements = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let data_len = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
 
-        let mut offsets = Vec::with_capacity(num_elements + 1);
-        let mut buf4 = [0u8; 4];
-        for _ in 0..=num_elements {
-            f.read_exact(&mut buf4)?;
-            offsets.push(u32::from_le_bytes(buf4));
-        }
+        let offsets_bytes = &raw[16..16 + (num_elements + 1) * 4];
+        let offsets: Vec<u32> = offsets_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
-        let mut data = Vec::with_capacity(data_len);
-        for _ in 0..data_len {
-            f.read_exact(&mut buf4)?;
-            data.push(u32::from_le_bytes(buf4));
-        }
+        let data_start = 16 + (num_elements + 1) * 4;
+        let data_bytes = &raw[data_start..data_start + data_len * 4];
+        let acc_data: Vec<u32> = data_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
-        Ok(Self { offsets, data })
+        Ok(Self { offsets, data: acc_data })
     }
 }
 
@@ -207,7 +202,7 @@ impl KmerDatabase {
         self.l
     }
 
-    /// Query a read: extract minimizers and look up each one.
+    /// Query a read: extract minimizers and look up each one
     pub fn query(&self, scanner: &crate::minimizer::MinimizerScanner, seq: &[u8]) -> Vec<Hit> {
         let minimizers = scanner.scan(seq);
         let has_acc = self.accessions.is_some();
@@ -215,8 +210,6 @@ impl KmerDatabase {
         minimizers
             .into_iter()
             .map(|m| {
-                // try_hash returns None for keys not in the original set,
-                // unlike hash() which panics
                 match self.mphf.try_hash(&m) {
                     Some(idx_u64) => {
                         let idx = idx_u64 as usize;
@@ -255,10 +248,8 @@ impl KmerDatabase {
             .collect()
     }
 
-    /// Save to disk with given prefix.
+    /// Save to disk 
     pub fn save(&self, prefix: &str) -> Result<()> {
-        eprintln!("Saving database to {}...", prefix);
-
         // Meta
         {
             let mut f = File::create(format!("{}.meta", prefix))?;
@@ -271,7 +262,7 @@ impl KmerDatabase {
             f.write_all(&[has_acc])?;
         }
 
-        // MPHF (using bincode for serde)
+        // MPHF (here i used bincode for serde)
         {
             let encoded = bincode::serialize(&self.mphf)?;
             std::fs::write(format!("{}.mphf", prefix), &encoded)?;
@@ -318,7 +309,8 @@ impl KmerDatabase {
 
     /// Load from disk.
     pub fn load(prefix: &str) -> Result<Self> {
-        eprintln!("Loading database from {}...", prefix);
+        eprintln!("Loading database from {}", prefix);
+        let load_start = std::time::Instant::now();
 
         // Meta
         let (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc) = {
@@ -345,6 +337,7 @@ impl KmerDatabase {
         };
 
         // MPHF
+        let t = std::time::Instant::now();
         let mphf: Mphf<u64> = {
             let data = std::fs::read(format!("{}.mphf", prefix))
                 .context("Cannot read .mphf file")?;
@@ -352,19 +345,18 @@ impl KmerDatabase {
         };
 
         // Fingerprints
+        let t = std::time::Instant::now();
         let fingerprints = {
-            let mut f = File::open(format!("{}.fp", prefix))
-                .context("Cannot open .fp file")?;
-            let mut fp = Vec::with_capacity(num_minimizers);
-            let mut buf = [0u8; 2];
-            for _ in 0..num_minimizers {
-                f.read_exact(&mut buf)?;
-                fp.push(u16::from_le_bytes(buf));
-            }
-            fp
+            let data = std::fs::read(format!("{}.fp", prefix))
+                .context("Cannot read .fp file")?;
+            assert_eq!(data.len(), num_minimizers * 2, ".fp file size mismatch");
+            data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<u16>>()
         };
 
         // TaxID indices
+        let t = std::time::Instant::now();
         let taxid_indices = {
             let mut f = File::open(format!("{}.taxid", prefix))
                 .context("Cannot open .taxid file")?;
@@ -374,29 +366,24 @@ impl KmerDatabase {
         };
 
         // TaxID mapping
+        let t = std::time::Instant::now();
         let index_to_taxid = {
-            let mut f = File::open(format!("{}.taxmap", prefix))
-                .context("Cannot open .taxmap file")?;
-            let mut buf8 = [0u8; 8];
-            f.read_exact(&mut buf8)?;
-            let sz = u64::from_le_bytes(buf8) as usize;
-            let mut v = Vec::with_capacity(sz);
-            let mut buf4 = [0u8; 4];
-            for _ in 0..sz {
-                f.read_exact(&mut buf4)?;
-                v.push(u32::from_le_bytes(buf4));
-            }
-            v
+            let data = std::fs::read(format!("{}.taxmap", prefix))
+                .context("Cannot read .taxmap file")?;
+            let sz = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+            assert_eq!(data.len(), 8 + sz * 4, ".taxmap file size mismatch");
+            data[8..].chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<u32>>()
         };
 
-        // Optional accession CSR
+        let t = std::time::Instant::now();
         let acc_path = format!("{}.accession", prefix);
         let accessions = if has_acc && Path::new(&acc_path).exists() {
             Some(CsrAccessions::load(&acc_path)?)
         } else {
             None
         };
-
         Ok(Self {
             k,
             l,
@@ -505,7 +492,7 @@ impl KmerDatabaseBuilder {
         eprintln!("  Extracted {} unique minimizers", num_minimizers);
 
         if num_minimizers == 0 {
-            anyhow::bail!("No minimizers found!");
+            anyhow::bail!("No minimizers found");
         }
 
         eprintln!("\nBuilding MPHF");
