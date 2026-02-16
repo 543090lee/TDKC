@@ -64,7 +64,6 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     )?;
 
     eprintln!("Extracted {} unique k-mers total", kmers.len());
-
     eprintln!("\nBuilding Database");
     let builder = KmerDatabaseBuilder::new(K, L, spaced_seed_mask, toggle_mask, config.track_accessions);
     let db = builder.build(&kmers, config.threads)?;

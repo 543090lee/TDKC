@@ -26,8 +26,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .num_threads(config.threads)
         .build_global()
         .ok();
-
-    // Load database
     let db = KmerDatabase::load(&config.db_prefix)?;
 
     // Load accession registry if available and requested
@@ -35,7 +33,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let acc_registry = if config.use_accessions {
         match AccessionRegistry::load(&acc_path) {
             Ok(reg) => {
-                eprintln!("Loaded {} accessions", reg.len());
                 Some(reg)
             }
             Err(_) => {
@@ -60,9 +57,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let classified = AtomicUsize::new(0);
     let unclassified = AtomicUsize::new(0);
 
-    // Read all FASTQ/FASTA records using needletail
+    // use needletail
     let records = read_sequences(&config.reads_file)?;
-    eprintln!("Loaded {} reads", records.len());
 
     let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
