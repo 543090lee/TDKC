@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
-
 use anyhow::{Context, Result};
 
 struct IndexEntry {
@@ -25,7 +24,6 @@ impl FastaIndex {
         let index = if Path::new(&fai_path).exists() {
             Self::load_fai(&fai_path)?
         } else {
-            eprintln!("Creating FASTA index...");
             let idx = Self::build_fai(fasta_path)?;
             Self::save_fai(&fai_path, &idx)?;
             idx
@@ -39,7 +37,7 @@ impl FastaIndex {
         })
     }
 
-    /// Fetch a sequence by name. Returns None if not found.
+    // Fetch a sequence by name. Returns None if not found.
     pub fn get_sequence(&self, name: &str) -> Option<String> {
         let entry = self.index.get(name)?;
 

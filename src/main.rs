@@ -48,17 +48,17 @@ enum Commands {
         #[arg(short = 'd', long)]
         db: String,
 
-        #[arg(short = 'r', long)]
-        reads: String,
+        #[arg(short = '1', long)]
+        read1: String,
+
+        #[arg(short = '2', long)]
+        read2: Option<String>,
 
         #[arg(short = 'j', long, default_value_t = 1)]
         threads: usize,
 
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         accession: bool,
-
-        #[arg(long)]
-        paired: bool,
 
         #[arg(short = 'c', long, default_value_t = 0.3)]
         coverage: f64,
@@ -94,19 +94,19 @@ fn main() -> anyhow::Result<()> {
 
         Commands::Query {
             db,
-            reads,
+            read1,
+            read2,
             threads,
             accession,
-            paired,
             coverage,
             output_prefix,
         } => {
             query::run_query(query::QueryConfig {
                 db_prefix: db,
-                reads_file: reads,
+                read1_file: read1,
+                read2_file: read2,
                 threads,
                 use_accessions: accession,
-                is_paired: paired,
                 coverage_threshold: coverage, 
                 output_prefix: output_prefix
             })?;

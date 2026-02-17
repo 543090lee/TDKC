@@ -11,4 +11,8 @@ make load and writing bulk, minimize write_all : loead is now fixed, maybe faste
 
 i might be using 2x memory when loading Accession registry since it's making id_to_name and name_to_id. but i dont need name_to_id during query time.
 
-paired end read feature: just concatenate and make it coverage for that one long string
+~~paired end read feature: just concatenate and make it coverage for that one long string~~
+
+it probably has to be streamlined i think, for writing output file. kinda inefficient i think
+
+Think about how fulgor does accession/color tracking, since in case if a majority of kmers are conserved then, RIP

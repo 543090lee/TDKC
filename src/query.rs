@@ -1,19 +1,19 @@
 use std::collections::HashMap;
-use std::io::{self, Write, BufWriter};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::fs::File;
 use anyhow::Result;
 use rayon::prelude::*;
-use crate::database::{AccessionRegistry, KmerDatabase};
+use crate::database::{AccessionRegistry, KmerDatabase, Hit};
 use crate::minimizer::MinimizerScanner;
 
 pub struct QueryConfig {
     pub db_prefix: String,
-    pub reads_file: String,
+    pub read1_file: String,
+    pub read2_file: Option<String>,
     pub threads: usize,
     pub use_accessions: bool,
-    pub is_paired: bool,
     pub coverage_threshold: f64,
     pub output_prefix: String,
 }
@@ -21,6 +21,12 @@ pub struct QueryConfig {
 struct FastqRecord {
     header: String,
     sequence: String,
+}
+
+/// Holds per-end hit info for output formatting
+struct EndHits<'a> {
+    seq_len: usize,
+    hits: &'a [Hit],
 }
 
 pub fn run_query(config: QueryConfig) -> Result<()> {
@@ -31,13 +37,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let db = KmerDatabase::load(&config.db_prefix)?;
     let coverage_threshold = config.coverage_threshold;
 
-    // Load accession registry if available and requested
     let acc_path = format!("{}.accessions", config.db_prefix);
     let acc_registry = if config.use_accessions {
         match AccessionRegistry::load(&acc_path) {
-            Ok(reg) => {
-                Some(reg)
-            }
+            Ok(reg) => Some(reg),
             Err(_) => {
                 eprintln!("No accession registry found, skipping accession output");
                 None
@@ -54,36 +57,76 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         db.toggle_mask,
     );
 
-    eprintln!("Classifying reads from {}...", config.reads_file);
+    let is_paired = config.read2_file.is_some();
+
+    eprintln!("Classifying reads");
+    if let Some(ref r2) = config.read2_file {
+        eprintln!("- Detected paired-end reads");
+    }
     let start = std::time::Instant::now();
 
     let classified = AtomicUsize::new(0);
     let unclassified = AtomicUsize::new(0);
 
-    // use needletail
-    let records = read_sequences(&config.reads_file)?;
+    let records1 = read_sequences(&config.read1_file)?;
+    let records2 = if let Some(ref r2) = config.read2_file {
+        let r2_recs = read_sequences(r2)?;
+        if r2_recs.len() != records1.len() {
+            anyhow::bail!(
+                "Read count mismatch: R1 has {} reads, R2 has {} reads",
+                records1.len(),
+                r2_recs.len()
+            );
+        }
+        Some(r2_recs)
+    } else {
+        None
+    };
 
     let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
     let batch_size = 5000;
-    records.par_chunks(batch_size).for_each(|batch| {
+
+    // Build index ranges for batching
+    let num_records = records1.len();
+    let batch_ranges: Vec<(usize, usize)> = (0..num_records)
+        .step_by(batch_size)
+        .map(|start| (start, (start + batch_size).min(num_records)))
+        .collect();
+
+    batch_ranges.par_iter().for_each(|&(batch_start, batch_end)| {
         let mut local_output = String::with_capacity(batch_size * 200);
 
-        for record in batch {
-            let seq = record.sequence.as_bytes();
-            let hits = db.query(&scanner, seq);
+        for i in batch_start..batch_end {
+            let record = &records1[i];
+            let seq1 = record.sequence.as_bytes();
+            let hits1 = db.query(&scanner, seq1);
 
-            let max_k = if seq.len() >= db.k() {
-                seq.len() - db.k() + 1
+            let (hits2_owned, seq2_bytes);
+            let (all_hits_refs, end2): (Vec<&Hit>, Option<EndHits>) = if let Some(ref r2) = records2 {
+                let r2_rec = &r2[i];
+                seq2_bytes = r2_rec.sequence.as_bytes().to_vec();
+                hits2_owned = db.query(&scanner, &seq2_bytes);
+                let combined: Vec<&Hit> = hits1.iter().chain(hits2_owned.iter()).collect();
+                (combined, Some(EndHits { seq_len: seq2_bytes.len(), hits: &hits2_owned }))
             } else {
-                1
+                seq2_bytes = Vec::new();
+                hits2_owned = Vec::new();
+                (hits1.iter().collect(), None)
             };
 
+            let end1 = EndHits { seq_len: seq1.len(), hits: &hits1 };
+
+            //coverage calc
+            let read1_window_length = if end1.seq_len >= db.k() {end1.seq_len - db.k() + 1 } else {1};
+            let read2_window_length = end2.as_ref().map_or(0, |e| {if e.seq_len >= db.k() {e.seq_len - db.k() + 1} else {1}});
+
+            let total_window = read1_window_length + read2_window_length;
+            
             let mut valid_hits = 0;
             let mut taxid_counts: HashMap<u8, usize> = HashMap::new();
             let mut acc_counts: HashMap<u32, usize> = HashMap::new();
 
-            for hit in &hits {
+            for hit in &all_hits_refs {
                 if hit.is_hit {
                     valid_hits += 1;
                     *taxid_counts.entry(hit.taxid_idx).or_default() += 1;
@@ -95,20 +138,26 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 }
             }
 
-            let coverage = valid_hits as f64 / max_k as f64;
+            let coverage = valid_hits as f64 / total_window as f64;
 
             if valid_hits == 0 || coverage < coverage_threshold {
-                local_output.push_str(&format!(
-                    "U\t{}\t0\t{}\t0:0\n",
-                    record.header,
-                    seq.len()
-                ));
+                if is_paired {
+                    let r2_rec = &records2.as_ref().unwrap()[i];
+                    local_output.push_str(&format!(
+                        "U\t{}\t0\t{}|{}\t0:0\n",
+                        record.header,
+                        seq1.len(),
+                        r2_rec.sequence.len(),
+                    ));
+                } else {
+                    local_output.push_str(&format!(
+                        "U\t{}\t0\t{}\t0:0\n",
+                        record.header,
+                        seq1.len()
+                    ));
+                }
                 unclassified.fetch_add(1, Ordering::Relaxed);
             } else {
-                
-                
-
-                // Find best taxid
                 let best_taxid_idx = taxid_counts
                     .iter()
                     .max_by_key(|(_, &count)| count)
@@ -117,36 +166,26 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
                 let best_taxid = db.true_taxid(best_taxid_idx);
 
-                // Build classification string
-                local_output.push_str(&format!(
-                    "C\t{}\t{}\t{}\t",
-                    record.header, best_taxid, seq.len()
-                ));
+                if is_paired {
+                    let r2_rec = &records2.as_ref().unwrap()[i];
+                    local_output.push_str(&format!(
+                        "C\t{}\t{}\t{}|{}\t",
+                        record.header, best_taxid, seq1.len(), r2_rec.sequence.len()
+                    ));
+                } else {
+                    local_output.push_str(&format!(
+                        "C\t{}\t{}\t{}\t",
+                        record.header, best_taxid, seq1.len()
+                    ));
+                }
 
-                // Run-length encode the hit pattern
-                if !hits.is_empty() {
-                    let mut current_taxid = if hits[0].is_hit {
-                        db.true_taxid(hits[0].taxid_idx)
-                    } else {
-                        0
-                    };
-                    let mut run_len = 1;
+                // Write R1 hit pattern
+                write_hit_pattern(&mut local_output, end1.hits, &db);
 
-                    for hit in hits.iter().skip(1) {
-                        let t = if hit.is_hit {
-                            db.true_taxid(hit.taxid_idx)
-                        } else {
-                            0
-                        };
-                        if t == current_taxid {
-                            run_len += 1;
-                        } else {
-                            local_output.push_str(&format!("{}:{} ", current_taxid, run_len));
-                            current_taxid = t;
-                            run_len = 1;
-                        }
-                    }
-                    local_output.push_str(&format!("{}:{}", current_taxid, run_len));
+                // If paired, separate with ||| and write R2 hit pattern
+                if let Some(ref e2) = end2 {
+                    local_output.push_str(" |:| ");
+                    write_hit_pattern(&mut local_output, e2.hits, &db);
                 }
 
                 // Accession info
@@ -162,23 +201,19 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                     }
                 }
 
-                // Coverage
                 local_output.push_str(&format!("\tcov:{:.3}\n", coverage));
-
                 classified.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        // Collect batch output
         let mut chunks = output_chunks.lock().unwrap();
         chunks.push(local_output.into_bytes());
     });
 
     // Write all output
     {
-        let mut f = File::create(format!("{}.output", config.output_prefix))?;
+        let f = File::create(format!("{}.output", config.output_prefix))?;
         let mut writer = io::BufWriter::new(f);
-
         let chunks = output_chunks.into_inner().unwrap();
         for chunk in chunks {
             writer.write_all(&chunk)?;
@@ -194,14 +229,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", total);
-    eprintln!(
-        "Rate:         {:.1}%",
-        if total > 0 {
-            100.0 * c as f64 / total as f64
-        } else {
-            0.0
-        }
-    );
     eprintln!("Time:         {:.2}s", elapsed.as_secs_f64());
     if elapsed.as_secs_f64() > 0.0 {
         eprintln!(
@@ -211,6 +238,37 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Write run-length encoded hit pattern for one end
+fn write_hit_pattern(out: &mut String, hits: &[Hit], db: &KmerDatabase) {
+    if hits.is_empty() {
+        out.push_str("0:0");
+        return;
+    }
+
+    let mut current_taxid = if hits[0].is_hit {
+        db.true_taxid(hits[0].taxid_idx)
+    } else {
+        0
+    };
+    let mut run_len = 1;
+
+    for hit in hits.iter().skip(1) {
+        let t = if hit.is_hit {
+            db.true_taxid(hit.taxid_idx)
+        } else {
+            0
+        };
+        if t == current_taxid {
+            run_len += 1;
+        } else {
+            out.push_str(&format!("{}:{} ", current_taxid, run_len));
+            current_taxid = t;
+            run_len = 1;
+        }
+    }
+    out.push_str(&format!("{}:{}", current_taxid, run_len));
 }
 
 fn read_sequences(path: &str) -> Result<Vec<FastqRecord>> {
