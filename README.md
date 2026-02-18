@@ -16,3 +16,5 @@ i might be using 2x memory when loading Accession registry since it's making id_
 it probably has to be streamlined i think, for writing output file. kinda inefficient i think
 
 Think about how fulgor does accession/color tracking, since in case if a majority of kmers are conserved then, RIP
+
+Maybe LDA for DSBMED project

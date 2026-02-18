@@ -23,7 +23,7 @@ struct FastqRecord {
     sequence: String,
 }
 
-/// Holds per-end hit info for output formatting
+// Holds per-end hit info for output formatting
 struct EndHits<'a> {
     seq_len: usize,
     hits: &'a [Hit],
@@ -84,6 +84,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     };
 
     let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    let report_counts: Mutex<HashMap<u32,usize>> = Mutex::new(HashMap::new());
     let batch_size = 5000;
 
     // Build index ranges for batching
@@ -95,6 +96,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     batch_ranges.par_iter().for_each(|&(batch_start, batch_end)| {
         let mut local_output = String::with_capacity(batch_size * 200);
+        let mut local_report: HashMap<u32,usize> = HashMap::new();
 
         for i in batch_start..batch_end {
             let record = &records1[i];
@@ -182,7 +184,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 // Write R1 hit pattern
                 write_hit_pattern(&mut local_output, end1.hits, &db);
 
-                // If paired, separate with ||| and write R2 hit pattern
                 if let Some(ref e2) = end2 {
                     local_output.push_str(" |:| ");
                     write_hit_pattern(&mut local_output, e2.hits, &db);
@@ -202,15 +203,21 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 }
 
                 local_output.push_str(&format!("\tcov:{:.3}\n", coverage));
+                *local_report.entry(best_taxid).or_default() += 1;
                 classified.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         let mut chunks = output_chunks.lock().unwrap();
         chunks.push(local_output.into_bytes());
+
+        let mut global_report = report_counts.lock().unwrap();
+        for(taxid, count) in local_report {
+            *global_report.entry(taxid).or_default() += count;
+        }
     });
 
-    // Write all output
+    // Write output
     {
         let f = File::create(format!("{}.output", config.output_prefix))?;
         let mut writer = io::BufWriter::new(f);
@@ -221,19 +228,38 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         writer.flush()?;
     }
 
+    // Write report
+    {
+        let f = File::create(format!("{}.report", config.output_prefix))?;
+        let mut writer = io::BufWriter::new(f);
+
+        let counts = report_counts.into_inner().unwrap();
+        let mut sorted: Vec<(u32,usize)> = counts.into_iter().collect();
+        sorted.sort_by(|a,b| b.1.cmp(&a.1));
+
+        writeln!(writer, "Target TaxID\tRead Count\tRead Fraction")?;
+        for (taxid,count) in &sorted {
+            let ratio = if num_records as f64 > 0.0 { *count as f64 / num_records as f64 } else {0.0};
+            writeln!(writer,"{}\t{}\t{}",taxid, count,ratio)?;
+        }
+        writer.flush()?;
+        
+    }
+
     let elapsed = start.elapsed();
     let c = classified.load(Ordering::Relaxed);
     let u = unclassified.load(Ordering::Relaxed);
-    let total = c + u;
+
+    if c+u != num_records {eprintln!("Warning C+U is not adding up to number of reads")};
 
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
-    eprintln!("Total:        {}", total);
+    eprintln!("Total:        {}", num_records);
     eprintln!("Time:         {:.2}s", elapsed.as_secs_f64());
     if elapsed.as_secs_f64() > 0.0 {
         eprintln!(
             "Throughput:   {:.0} reads/s",
-            total as f64 / elapsed.as_secs_f64()
+            num_records as f64 / elapsed.as_secs_f64()
         );
     }
 
