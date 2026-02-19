@@ -13,8 +13,11 @@ i might be using 2x memory when loading Accession registry since it's making id_
 
 ~~paired end read feature: just concatenate and make it coverage for that one long string~~
 
-it probably has to be streamlined i think, for writing output file. kinda inefficient i think
+~~it probably has to be streamlined i think, for writing output file. kinda inefficient i think~~
 
 Think about how fulgor does accession/color tracking, since in case if a majority of kmers are conserved then, RIP
 
-Maybe LDA for DSBMED project
+~~SIMD vectorization~~
+
+stream FASTQ not load all at once
+
