@@ -237,10 +237,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let mut sorted: Vec<(u32,usize)> = counts.into_iter().collect();
         sorted.sort_by(|a,b| b.1.cmp(&a.1));
 
-        writeln!(writer, "Target TaxID\tRead Count\tRead Fraction")?;
+        writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
         for (taxid,count) in &sorted {
             let ratio = if num_records as f64 > 0.0 { *count as f64 / num_records as f64 } else {0.0};
-            writeln!(writer,"{}\t{}\t{}",taxid, count,ratio)?;
+            writeln!(writer,"{}\t{}\t{:0.3}",taxid, count,ratio)?;
         }
         writer.flush()?;
         
