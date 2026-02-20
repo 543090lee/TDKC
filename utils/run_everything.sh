@@ -1,27 +1,37 @@
 #!/bin/bash
 
 CLASSIFIER="/Users/seungmolee/Desktop/metagenomic/distilled_model/rust_sample_test/target/release/kmer-db"
-DB_PREFIX="mydb"
+DB_PREFIX="/Users/seungmolee/Desktop/metagenomic/distilled_model/rust_sample_test/mydb"
 INPUT_DIR="/Users/seungmolee/Desktop/metagenomic/distilled_model/kaiser2-tecan"
 OUTPUT_DIR="/Users/seungmolee/Desktop/metagenomic/distilled_model/rust_sample_test/mass_result"
 THREADS="14"
 
 mkdir -p "$OUTPUT_DIR"
 
-for fastq in "$INPUT_DIR"/*.fastq.gz; do
-    filename=$(basename "$fastq")
-    
+count=0
 
-    if [[ $filename =~ ([A-H][0-9]{2}).*_(R[12])_ ]]; then
-        well="${BASH_REMATCH[1]}"
-        read="${BASH_REMATCH[2]}"
-        output_name="${well}_${read}"
-    else
-        output_name="${filename%.fastq.gz}"
+for r1 in "$INPUT_DIR"/*_R1_*.fastq.gz; do
+    [ -f "$r1" ] || continue
+    
+    r2="${r1/_R1_/_R2_}"
+    
+    if [ ! -f "$r2" ]; then
+        echo "No r2 found, gonna skip r2"
+        continue
     fi
     
-    echo "Currently running: $filename -> $output_name"
+    filename=$(basename "$r1")
+    if [[ $filename =~ ([A-H][0-9]{2}) ]]; then
+        output_name="${BASH_REMATCH[1]}"
+    else
+        output_name="${filename%_R1_*.fastq.gz}"
+    fi
     
-    "$CLASSIFIER" query -d "$DB_PREFIX" -1 "$fastq" -2 "$fastq" -j "$THREADS" -a -o "$output_name" 
+    echo "Currently running $output_name"
     
+    "$CLASSIFIER" query -d "$DB_PREFIX" -1 "$r1" -2 "$r2" -j "$THREADS" -a -o "$OUTPUT_DIR/${output_name}"
+    
+    count=$((count + 1))
 done
+
+echo "Done, and processed $count samples."

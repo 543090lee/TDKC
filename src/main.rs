@@ -39,7 +39,7 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         accession: bool,
 
     },
