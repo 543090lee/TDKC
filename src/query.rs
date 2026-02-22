@@ -58,29 +58,47 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     if is_paired {
         eprintln!("- Detected paired-end reads");
     }
+
+    // ── Load reads (R1 and R2 in parallel if paired) ──
+    let load_start = std::time::Instant::now();
+
+    let (records1, records2) = if let Some(ref r2_path) = config.read2_file {
+        let r2_path = r2_path.clone();
+        let r1_path = config.read1_file.clone();
+
+        let (r1_result, r2_result) = rayon::join(
+            || read_sequences(&r1_path),
+            || read_sequences(&r2_path),
+        );
+
+        let r1 = r1_result?;
+        let r2 = r2_result?;
+
+        if r1.len() != r2.len() {
+            anyhow::bail!(
+                "Read count mismatch: R1 has {} reads, R2 has {} reads",
+                r1.len(),
+                r2.len()
+            );
+        }
+        (r1, Some(r2))
+    } else {
+        (read_sequences(&config.read1_file)?, None)
+    };
+
+    let load_elapsed = load_start.elapsed();
+    eprintln!("Loaded {} reads in {:.2}s", records1.len(), load_elapsed.as_secs_f64());
+
     let start = std::time::Instant::now();
 
     let classified = AtomicUsize::new(0);
     let unclassified = AtomicUsize::new(0);
 
-    let records1 = read_sequences(&config.read1_file)?;
-    let records2 = if let Some(ref r2) = config.read2_file {
-        let r2_recs = read_sequences(r2)?;
-        if r2_recs.len() != records1.len() {
-            anyhow::bail!(
-                "Read count mismatch: R1 has {} reads, R2 has {} reads",
-                records1.len(),
-                r2_recs.len()
-            );
-        }
-        Some(r2_recs)
-    } else {
-        None
-    };
-
     let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
     let report_counts: Mutex<HashMap<u32, usize>> = Mutex::new(HashMap::new());
-    let batch_size = 5000;
+
+    // Smaller batches for better thread utilization with many cores
+    let batch_size = 1000;
 
     let num_records = records1.len();
     let batch_ranges: Vec<(usize, usize)> = (0..num_records)
@@ -281,13 +299,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", num_records);
-    eprintln!("Time:         {:.2}s", elapsed.as_secs_f64());
-    if elapsed.as_secs_f64() > 0.0 {
-        eprintln!(
-            "Throughput:   {:.0} reads/s",
-            num_records as f64 / elapsed.as_secs_f64()
-        );
-    }
+    eprintln!("Load time:    {:.2}s", load_elapsed.as_secs_f64());
+    eprintln!("Classify time:{:.2}s", elapsed.as_secs_f64());
+    eprintln!("Total time:   {:.2}s", load_elapsed.as_secs_f64() + elapsed.as_secs_f64());
 
     Ok(())
 }
