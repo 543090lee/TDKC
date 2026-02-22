@@ -26,7 +26,6 @@ enum Commands {
         #[arg(short = 'f', long)]
         fasta: String,
 
-        /// target taxids txt (one per line, with header)
         #[arg(short = 't', long)]
         targets: String,
 

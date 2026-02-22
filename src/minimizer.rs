@@ -50,15 +50,17 @@ impl MinimizerScanner {
         }
     }
 
-    /// Extract all minimizers from a sequence.
-    /// Returns a Vec of minimizer values (one per k-mer window position).
-    pub fn scan(&self, seq: &[u8]) -> Vec<u64> {
+    /// Extract all minimizers from a sequence into a reusable buffer.
+    /// Clears `out` before filling it. Returns one minimizer per k-mer window position.
+    pub fn scan_into(&self, seq: &[u8], out: &mut Vec<u64>) {
+        out.clear();
+
         if seq.len() < self.k {
-            return Vec::new();
+            return;
         }
 
-        let mut results = Vec::with_capacity(seq.len() - self.k + 1);
-        let mut queue: VecDeque<(u64, usize)> = VecDeque::new(); // (candidate, position)
+        out.reserve(seq.len() - self.k + 1);
+        let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
         let mut lmer: u64 = 0;
         let mut valid: usize = 0;
 
@@ -89,7 +91,7 @@ impl MinimizerScanner {
             while queue.back().map_or(false, |&(c, _)| c > candidate) {
                 queue.pop_back();
             }
-            let pos = i + 1 - self.l; // position of this l-mer in the sequence
+            let pos = i + 1 - self.l;
             queue.push_back((candidate, pos));
 
             // Remove expired entries
@@ -105,12 +107,17 @@ impl MinimizerScanner {
             // Emit minimizer if we have a full k-mer window
             if i + 1 >= self.k {
                 if let Some(&(min_val, _)) = queue.front() {
-                    results.push(min_val ^ self.toggle_mask);
+                    out.push(min_val ^ self.toggle_mask);
                 }
             }
         }
+    }
 
-        results
+    /// Extract all minimizers from a sequence (allocating version, kept for build path).
+    pub fn scan(&self, seq: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.scan_into(seq, &mut out);
+        out
     }
 
     /// Extract the first minimizer from a sequence (for building).

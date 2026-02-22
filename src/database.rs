@@ -179,11 +179,15 @@ pub struct KmerDatabase {
 }
 
 /// Query hit result for a single minimizer.
-pub struct Hit {
+/// Borrows accession data directly from the database's CSR storage.
+pub struct Hit<'a> {
     pub taxid_idx: u8,
-    pub accessions: Vec<u32>,
+    pub accessions: &'a [u32],
     pub is_hit: bool,
 }
+
+/// Static empty slice used for hits with no accessions.
+const EMPTY_ACCESSIONS: &[u32] = &[];
 
 impl KmerDatabase {
     pub fn true_taxid(&self, idx: u8) -> u32 {
@@ -201,53 +205,55 @@ impl KmerDatabase {
         self.l
     }
 
-    /// Query a read: extract minimizers and look up each one
-    pub fn query(&self, scanner: &crate::minimizer::MinimizerScanner, seq: &[u8]) -> Vec<Hit> {
-        let minimizers = scanner.scan(seq);
+    /// Query a read: extract minimizers and look up each one.
+    /// Results are appended to the provided `out` buffer (caller should clear it first).
+    pub fn query_into<'db>(
+        &'db self,
+        scanner: &crate::minimizer::MinimizerScanner,
+        seq: &[u8],
+        minimizer_buf: &mut Vec<u64>,
+        out: &mut Vec<Hit<'db>>,
+    ) {
+        scanner.scan_into(seq, minimizer_buf);
         let has_acc = self.accessions.is_some();
 
-        minimizers
-            .into_iter()
-            .map(|m| {
-                match self.mphf.try_hash(&m) {
-                    Some(idx_u64) => {
-                        let idx = idx_u64 as usize;
-                        if idx < self.num_minimizers
-                            && self.fingerprints[idx] == compute_fingerprint(m)
-                        {
-                            let accessions = if has_acc {
-                                self.accessions
-                                    .as_ref()
-                                    .unwrap()
-                                    .get(idx)
-                                    .to_vec()
-                            } else {
-                                Vec::new()
-                            };
-                            Hit {
-                                taxid_idx: self.taxid_indices[idx],
-                                accessions,
-                                is_hit: true,
-                            }
+        out.reserve(minimizer_buf.len());
+        for &m in minimizer_buf.iter() {
+            let hit = match self.mphf.try_hash(&m) {
+                Some(idx_u64) => {
+                    let idx = idx_u64 as usize;
+                    if idx < self.num_minimizers
+                        && self.fingerprints[idx] == compute_fingerprint(m)
+                    {
+                        let accessions = if has_acc {
+                            self.accessions.as_ref().unwrap().get(idx)
                         } else {
-                            Hit {
-                                taxid_idx: 0,
-                                accessions: Vec::new(),
-                                is_hit: false,
-                            }
+                            EMPTY_ACCESSIONS
+                        };
+                        Hit {
+                            taxid_idx: self.taxid_indices[idx],
+                            accessions,
+                            is_hit: true,
+                        }
+                    } else {
+                        Hit {
+                            taxid_idx: 0,
+                            accessions: EMPTY_ACCESSIONS,
+                            is_hit: false,
                         }
                     }
-                    None => Hit {
-                        taxid_idx: 0,
-                        accessions: Vec::new(),
-                        is_hit: false,
-                    },
                 }
-            })
-            .collect()
+                None => Hit {
+                    taxid_idx: 0,
+                    accessions: EMPTY_ACCESSIONS,
+                    is_hit: false,
+                },
+            };
+            out.push(hit);
+        }
     }
 
-    /// Save to disk 
+    /// Save to disk
     pub fn save(&self, prefix: &str) -> Result<()> {
         // Meta
         {
