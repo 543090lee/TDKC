@@ -7,6 +7,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use crate::database::{AccessionRegistry, KmerDatabase, Hit};
 use crate::minimizer::MinimizerScanner;
+use rustc_hash::FxHashMap;
 
 pub struct QueryConfig {
     pub db_prefix: String,
@@ -96,7 +97,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let mut hits2: Vec<Hit> = Vec::new();
         let mut minimizer_buf1: Vec<u64> = Vec::new();
         let mut minimizer_buf2: Vec<u64> = Vec::new();
-        let mut acc_counts: HashMap<u32, usize> = HashMap::new();
+        let mut acc_counts: FxHashMap<u32, usize> = FxHashMap::default();
 
         for i in batch_start..batch_end {
             let record = &records1[i];
@@ -327,10 +328,10 @@ fn read_sequences(path: &str) -> Result<Vec<FastqRecord>> {
 
     let mut records = Vec::new();
     let mut reader = parse_fastx_file(path)
-        .map_err(|e| anyhow::anyhow!("Cannot open reads file", e))?;
+        .map_err(|e| anyhow::anyhow!("Cannot open reads file {}", e))?;
 
     while let Some(result) = reader.next() {
-        let rec = result.map_err(|e| anyhow::anyhow!("Not sure what is going on, but cant read records", e))?;
+        let rec = result.map_err(|e| anyhow::anyhow!("Not sure what is going on, but cant read records in {}", e))?;
 
         let header = std::str::from_utf8(rec.id())
             .unwrap_or("")
