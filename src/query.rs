@@ -60,7 +60,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let is_paired = config.read2_file.is_some();
 
     eprintln!("Classifying reads");
-    if let Some(ref r2) = config.read2_file {
+    if let Some(ref _r2) = config.read2_file {
         eprintln!("- Detected paired-end reads");
     }
     let start = std::time::Instant::now();
@@ -73,7 +73,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let r2_recs = read_sequences(r2)?;
         if r2_recs.len() != records1.len() {
             anyhow::bail!(
-                "Read count mismatch: R1 has {} reads, R2 has {} reads",
+                "Read count mismatch - R1 has {} reads, R2 has {} reads, check your reads file again!",
                 records1.len(),
                 r2_recs.len()
             );
@@ -84,7 +84,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     };
 
     let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-    let report_counts: Mutex<HashMap<u32,usize>> = Mutex::new(HashMap::new());
+    let report_counts: Mutex<HashMap<u32, usize>> = Mutex::new(HashMap::new());
     let batch_size = 5000;
 
     // Build index ranges for batching
@@ -95,8 +95,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .collect();
 
     batch_ranges.par_iter().for_each(|&(batch_start, batch_end)| {
-        let mut local_output = String::with_capacity(batch_size * 200);
-        let mut local_report: HashMap<u32,usize> = HashMap::new();
+        let mut local_output: Vec<u8> = Vec::with_capacity(batch_size * 200);
+        let mut local_report: HashMap<u32, usize> = HashMap::new();
 
         for i in batch_start..batch_end {
             let record = &records1[i];
@@ -118,12 +118,14 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
             let end1 = EndHits { seq_len: seq1.len(), hits: &hits1 };
 
-            //coverage calc
-            let read1_window_length = if end1.seq_len >= db.k() {end1.seq_len - db.k() + 1 } else {1};
-            let read2_window_length = end2.as_ref().map_or(0, |e| {if e.seq_len >= db.k() {e.seq_len - db.k() + 1} else {1}});
+            // coverage calc
+            let read1_window_length = if end1.seq_len >= db.k() { end1.seq_len - db.k() + 1 } else { 1 };
+            let read2_window_length = end2.as_ref().map_or(0, |e| {
+                if e.seq_len >= db.k() { e.seq_len - db.k() + 1 } else { 1 }
+            });
 
             let total_window = read1_window_length + read2_window_length;
-            
+
             let mut valid_hits = 0;
             let mut taxid_counts: HashMap<u8, usize> = HashMap::new();
             let mut acc_counts: HashMap<u32, usize> = HashMap::new();
@@ -145,18 +147,20 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             if valid_hits == 0 || coverage < coverage_threshold {
                 if is_paired {
                     let r2_rec = &records2.as_ref().unwrap()[i];
-                    local_output.push_str(&format!(
+                    let _ = write!(
+                        local_output,
                         "U\t{}\t0\t{}|{}\t0:0\n",
                         record.header,
                         seq1.len(),
                         r2_rec.sequence.len(),
-                    ));
+                    );
                 } else {
-                    local_output.push_str(&format!(
+                    let _ = write!(
+                        local_output,
                         "U\t{}\t0\t{}\t0:0\n",
                         record.header,
                         seq1.len()
-                    ));
+                    );
                 }
                 unclassified.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -170,49 +174,52 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
                 if is_paired {
                     let r2_rec = &records2.as_ref().unwrap()[i];
-                    local_output.push_str(&format!(
+                    let _ = write!(
+                        local_output,
                         "C\t{}\t{}\t{}|{}\t",
                         record.header, best_taxid, seq1.len(), r2_rec.sequence.len()
-                    ));
+                    );
                 } else {
-                    local_output.push_str(&format!(
+                    let _ = write!(
+                        local_output,
                         "C\t{}\t{}\t{}\t",
                         record.header, best_taxid, seq1.len()
-                    ));
+                    );
                 }
 
                 // Write R1 hit pattern
                 write_hit_pattern(&mut local_output, end1.hits, &db);
 
                 if let Some(ref e2) = end2 {
-                    local_output.push_str(" |:| ");
+                    local_output.extend_from_slice(b" |:| ");
                     write_hit_pattern(&mut local_output, e2.hits, &db);
                 }
 
                 // Accession info
                 if acc_registry.is_some() && !acc_counts.is_empty() {
-                    local_output.push('\t');
+                    local_output.push(b'\t');
                     let reg = acc_registry.as_ref().unwrap();
                     for (acc_id, count) in &acc_counts {
-                        local_output.push_str(&format!(
+                        let _ = write!(
+                            local_output,
                             "{}:{} ",
                             reg.get_name(*acc_id),
                             count
-                        ));
+                        );
                     }
                 }
 
-                local_output.push_str(&format!("\tcov:{:.3}\n", coverage));
+                let _ = write!(local_output, "\tcov:{:.3}\n", coverage);
                 *local_report.entry(best_taxid).or_default() += 1;
                 classified.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         let mut chunks = output_chunks.lock().unwrap();
-        chunks.push(local_output.into_bytes());
+        chunks.push(local_output);
 
         let mut global_report = report_counts.lock().unwrap();
-        for(taxid, count) in local_report {
+        for (taxid, count) in local_report {
             *global_report.entry(taxid).or_default() += count;
         }
     });
@@ -234,23 +241,24 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let mut writer = io::BufWriter::new(f);
 
         let counts = report_counts.into_inner().unwrap();
-        let mut sorted: Vec<(u32,usize)> = counts.into_iter().collect();
-        sorted.sort_by(|a,b| b.1.cmp(&a.1));
+        let mut sorted: Vec<(u32, usize)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
         writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
-        for (taxid,count) in &sorted {
-            let ratio = if num_records as f64 > 0.0 { *count as f64 / num_records as f64 } else {0.0};
-            writeln!(writer,"{}\t{}\t{:0.3}",taxid, count,ratio)?;
+        for (taxid, count) in &sorted {
+            let ratio = if num_records as f64 > 0.0 { *count as f64 / num_records as f64 } else { 0.0 };
+            writeln!(writer, "{}\t{}\t{:0.3}", taxid, count, ratio)?;
         }
         writer.flush()?;
-        
     }
 
     let elapsed = start.elapsed();
     let c = classified.load(Ordering::Relaxed);
     let u = unclassified.load(Ordering::Relaxed);
 
-    if c+u != num_records {eprintln!("Warning C+U is not adding up to number of reads")};
+    if c + u != num_records {
+        eprintln!("Warning C+U is not adding up to number of reads");
+    }
 
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
@@ -266,10 +274,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     Ok(())
 }
 
-/// Write run-length encoded hit pattern for one end
-fn write_hit_pattern(out: &mut String, hits: &[Hit], db: &KmerDatabase) {
+/// Write run-length encoded hit pattern for one end directly into a byte buffer.
+fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
     if hits.is_empty() {
-        out.push_str("0:0");
+        out.extend_from_slice(b"0:0");
         return;
     }
 
@@ -278,7 +286,7 @@ fn write_hit_pattern(out: &mut String, hits: &[Hit], db: &KmerDatabase) {
     } else {
         0
     };
-    let mut run_len = 1;
+    let mut run_len: u32 = 1;
 
     for hit in hits.iter().skip(1) {
         let t = if hit.is_hit {
@@ -289,12 +297,12 @@ fn write_hit_pattern(out: &mut String, hits: &[Hit], db: &KmerDatabase) {
         if t == current_taxid {
             run_len += 1;
         } else {
-            out.push_str(&format!("{}:{} ", current_taxid, run_len));
+            let _ = write!(out, "{}:{} ", current_taxid, run_len);
             current_taxid = t;
             run_len = 1;
         }
     }
-    out.push_str(&format!("{}:{}", current_taxid, run_len));
+    let _ = write!(out, "{}:{}", current_taxid, run_len);
 }
 
 fn read_sequences(path: &str) -> Result<Vec<FastqRecord>> {
@@ -302,10 +310,10 @@ fn read_sequences(path: &str) -> Result<Vec<FastqRecord>> {
 
     let mut records = Vec::new();
     let mut reader = parse_fastx_file(path)
-        .map_err(|e| anyhow::anyhow!("Cannot open reads file: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Cannot open reads file", e))?;
 
     while let Some(result) = reader.next() {
-        let rec = result.map_err(|e| anyhow::anyhow!("Error reading record: {}", e))?;
+        let rec = result.map_err(|e| anyhow::anyhow!("Not sure, but error while reading", e))?;
 
         let header = std::str::from_utf8(rec.id())
             .unwrap_or("")
