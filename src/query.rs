@@ -24,6 +24,12 @@ struct FastqRecord {
     sequence: String,
 }
 
+// A chunk of paired reads ready for classification
+struct ReadChunk {
+    records1: Vec<FastqRecord>,
+    records2: Option<Vec<FastqRecord>>,
+}
+
 pub fn run_query(config: QueryConfig) -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.threads)
@@ -54,116 +60,124 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     let is_paired = config.read2_file.is_some();
 
-    eprintln!("Classifying reads");
     if is_paired {
-        eprintln!("- Detected paired-end reads");
-    }
-
-    // ── Load reads (R1 and R2 in parallel if paired) ──
-    let load_start = std::time::Instant::now();
-
-    let (records1, records2) = if let Some(ref r2_path) = config.read2_file {
-        let r2_path = r2_path.clone();
-        let r1_path = config.read1_file.clone();
-
-        let (r1_result, r2_result) = rayon::join(
-            || read_sequences(&r1_path),
-            || read_sequences(&r2_path),
-        );
-
-        let r1 = r1_result?;
-        let r2 = r2_result?;
-
-        if r1.len() != r2.len() {
-            anyhow::bail!(
-                "Read count mismatch: R1 has {} reads, R2 has {} reads",
-                r1.len(),
-                r2.len()
-            );
-        }
-        (r1, Some(r2))
+        eprintln!("Running paired-end reads");
     } else {
-        (read_sequences(&config.read1_file)?, None)
-    };
-
-    let load_elapsed = load_start.elapsed();
-    eprintln!("Loaded {} reads in {:.2}s", records1.len(), load_elapsed.as_secs_f64());
+        eprintln!("Running single-end reads");
+    }
 
     let start = std::time::Instant::now();
 
     let classified = AtomicUsize::new(0);
     let unclassified = AtomicUsize::new(0);
+    let total_records = AtomicUsize::new(0);
 
-    let output_chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    // Output file, batches write directly
+    let output_file = File::create(format!("{}.output", config.output_prefix))?;
+    let output_writer = Mutex::new(io::BufWriter::with_capacity(4 * 1024 * 1024, output_file));
     let report_counts: Mutex<HashMap<u32, usize>> = Mutex::new(HashMap::new());
 
-    // Smaller batches for better thread utilization with many cores
-    let batch_size = 1000;
+    // we have double buffer here, where a reader thread keeps on reading
+    // and the main thread gets the chunk and dispatch them into rayon for classification
+    // 2 channels seem reasonable, since on 45M reads, rayon was little falling behind
+    let chunk_size = 100_000;
 
-    let num_records = records1.len();
-    let batch_ranges: Vec<(usize, usize)> = (0..num_records)
-        .step_by(batch_size)
-        .map(|start| (start, (start + batch_size).min(num_records)))
-        .collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ReadChunk>(2);
 
-    batch_ranges.par_iter().for_each(|&(batch_start, batch_end)| {
-        let mut local_output: Vec<u8> = Vec::with_capacity(batch_size * 200);
-        let mut local_report: HashMap<u32, usize> = HashMap::new();
+    let r1_path = config.read1_file.clone();
+    let r2_path = config.read2_file.clone();
 
-        // Reusable buffers — allocated once per batch, reused every read
-        let mut hits1: Vec<Hit> = Vec::new();
-        let mut hits2: Vec<Hit> = Vec::new();
-        let mut minimizer_buf1: Vec<u64> = Vec::new();
-        let mut minimizer_buf2: Vec<u64> = Vec::new();
-        let mut acc_counts: FxHashMap<u32, usize> = FxHashMap::default();
+    // Reader thread, not a rayon thread pool
+    let reader_handle = std::thread::spawn(move || -> Result<()> {
+        let mut r1_reader = open_fastx(&r1_path)?;
+        let mut r2_reader = match r2_path {
+            Some(ref p) => Some(open_fastx(p)?),
+            None => None,
+        };
 
-        for i in batch_start..batch_end {
-            let record = &records1[i];
-            let seq1 = record.sequence.as_bytes();
-
-            // Query R1 — clears and fills hits1
-            hits1.clear();
-            db.query_into(&scanner, seq1, &mut minimizer_buf1, &mut hits1);
-
-            let (seq2_len, has_r2) = if let Some(ref r2) = records2 {
-                let r2_rec = &r2[i];
-                let seq2 = r2_rec.sequence.as_bytes();
-                hits2.clear();
-                db.query_into(&scanner, seq2, &mut minimizer_buf2, &mut hits2);
-                (seq2.len(), true)
-            } else {
-                (0, false)
-            };
-
-            // Coverage calc
-            let read1_window = if seq1.len() >= db.k() { seq1.len() - db.k() + 1 } else { 1 };
-            let read2_window = if has_r2 {
-                if seq2_len >= db.k() { seq2_len - db.k() + 1 } else { 1 }
-            } else {
-                0
-            };
-            let total_window = read1_window + read2_window;
-
-            let mut valid_hits: usize = 0;
-            let mut taxid_counts = [0u32; 256];
-            acc_counts.clear();
-
-            // Count hits from R1
-            for hit in hits1.iter() {
-                if hit.is_hit {
-                    valid_hits += 1;
-                    taxid_counts[hit.taxid_idx as usize] += 1;
-                    if acc_registry.is_some() {
-                        for &acc in hit.accessions {
-                            *acc_counts.entry(acc).or_default() += 1;
-                        }
-                    }
-                }
+        loop {
+            let recs1 = read_chunk(&mut r1_reader, chunk_size)?;
+            if recs1.is_empty() {
+                break;
             }
 
-            // Count hits from R2
-            if has_r2 {
-                for hit in hits2.iter() {
+            let recs2 = if let Some(ref mut r2) = r2_reader {
+                let c2 = read_chunk(r2, chunk_size)?;
+                if c2.len() != recs1.len() {
+                    anyhow::bail!(
+                        "Read count mismatch in chunk: R1 has {} reads, R2 has {} reads",
+                        recs1.len(),
+                        c2.len()
+                    );
+                }
+                Some(c2)
+            } else {
+                None
+            };
+
+            if tx.send(ReadChunk { records1: recs1, records2: recs2 }).is_err() {
+                break; // Receiver dropped
+            }
+        }
+        Ok(())
+    });
+
+    // Classify chunks as they arrive 
+    // Since the chunk size is 100K, if you do 10k batch size, there will only be 10 tasks
+    // If you have more threads than that, maybe it's a good idea to go below. But going below that
+    // plateus. At least locally on my laptop M4 Max
+  
+    let batch_size = 10000;
+
+    for chunk in rx {
+        let chunk_len = chunk.records1.len();
+        total_records.fetch_add(chunk_len, Ordering::Relaxed);
+
+        let batch_ranges: Vec<(usize, usize)> = (0..chunk_len)
+            .step_by(batch_size)
+            .map(|s| (s, (s + batch_size).min(chunk_len)))
+            .collect();
+
+        batch_ranges.par_iter().for_each(|&(batch_start, batch_end)| {
+            let mut local_output: Vec<u8> = Vec::with_capacity(batch_size * 200);
+            let mut local_report: HashMap<u32, usize> = HashMap::new();
+
+            let mut hits1: Vec<Hit> = Vec::new();
+            let mut hits2: Vec<Hit> = Vec::new();
+            let mut minimizer_buf1: Vec<u64> = Vec::new();
+            let mut minimizer_buf2: Vec<u64> = Vec::new();
+            let mut acc_counts: FxHashMap<u32, usize> = FxHashMap::default();
+
+            for i in batch_start..batch_end {
+                let record = &chunk.records1[i];
+                let seq1 = record.sequence.as_bytes();
+
+                hits1.clear();
+                db.query_into(&scanner, seq1, &mut minimizer_buf1, &mut hits1);
+
+                let (seq2_len, has_r2) = if let Some(ref r2) = chunk.records2 {
+                    let r2_rec = &r2[i];
+                    let seq2 = r2_rec.sequence.as_bytes();
+                    hits2.clear();
+                    db.query_into(&scanner, seq2, &mut minimizer_buf2, &mut hits2);
+                    (seq2.len(), true)
+                } else {
+                    (0, false)
+                };
+
+                let read1_window = if seq1.len() >= db.k() { seq1.len() - db.k() + 1 } else { 1 };
+                let read2_window = if has_r2 {
+                    if seq2_len >= db.k() { seq2_len - db.k() + 1 } else { 1 }
+                } else {
+                    0
+                };
+                let total_window = read1_window + read2_window;
+
+                let mut valid_hits: usize = 0;
+                let mut taxid_counts = [0u32; 256];
+                acc_counts.clear();
+
+                for hit in hits1.iter() {
                     if hit.is_hit {
                         valid_hits += 1;
                         taxid_counts[hit.taxid_idx as usize] += 1;
@@ -174,102 +188,119 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                         }
                     }
                 }
-            }
-
-            let coverage = valid_hits as f64 / total_window as f64;
-
-            if valid_hits == 0 || coverage < coverage_threshold {
-                if is_paired {
-                    let _ = write!(
-                        local_output,
-                        "U\t{}\t0\t{}|{}\t0:0\n",
-                        record.header,
-                        seq1.len(),
-                        seq2_len,
-                    );
-                } else {
-                    let _ = write!(
-                        local_output,
-                        "U\t{}\t0\t{}\t0:0\n",
-                        record.header,
-                        seq1.len()
-                    );
-                }
-                unclassified.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // Find best taxid from the fixed-size array
-                let mut best_taxid_idx: u8 = 0;
-                let mut best_count: u32 = 0;
-                for (idx, &count) in taxid_counts.iter().enumerate() {
-                    if count > best_count {
-                        best_count = count;
-                        best_taxid_idx = idx as u8;
-                    }
-                }
-
-                let best_taxid = db.true_taxid(best_taxid_idx);
-
-                if is_paired {
-                    let _ = write!(
-                        local_output,
-                        "C\t{}\t{}\t{}|{}\t",
-                        record.header, best_taxid, seq1.len(), seq2_len
-                    );
-                } else {
-                    let _ = write!(
-                        local_output,
-                        "C\t{}\t{}\t{}\t",
-                        record.header, best_taxid, seq1.len()
-                    );
-                }
-
-                // Write R1 hit pattern
-                write_hit_pattern(&mut local_output, &hits1, &db);
 
                 if has_r2 {
-                    local_output.extend_from_slice(b" |:| ");
-                    write_hit_pattern(&mut local_output, &hits2, &db);
-                }
-
-                // Accession info
-                if acc_registry.is_some() && !acc_counts.is_empty() {
-                    local_output.push(b'\t');
-                    let reg = acc_registry.as_ref().unwrap();
-                    for (acc_id, count) in acc_counts.iter() {
-                        let _ = write!(
-                            local_output,
-                            "{}:{} ",
-                            reg.get_name(*acc_id),
-                            count
-                        );
+                    for hit in hits2.iter() {
+                        if hit.is_hit {
+                            valid_hits += 1;
+                            taxid_counts[hit.taxid_idx as usize] += 1;
+                            if acc_registry.is_some() {
+                                for &acc in hit.accessions {
+                                    *acc_counts.entry(acc).or_default() += 1;
+                                }
+                            }
+                        }
                     }
                 }
 
-                let _ = write!(local_output, "\tcov:{:.3}\n", coverage);
-                *local_report.entry(best_taxid).or_default() += 1;
-                classified.fetch_add(1, Ordering::Relaxed);
+                let coverage = valid_hits as f64 / total_window as f64;
+
+                if valid_hits == 0 || coverage < coverage_threshold {
+                    if is_paired {
+                        let _ = write!(
+                            local_output,
+                            "U\t{}\t0\t{}|{}\t0:0\n",
+                            record.header, seq1.len(), seq2_len,
+                        );
+                    } else {
+                        let _ = write!(
+                            local_output,
+                            "U\t{}\t0\t{}\t0:0\n",
+                            record.header, seq1.len()
+                        );
+                    }
+                    unclassified.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let mut best_taxid_idx: u8 = 0;
+                    let mut best_count: u32 = 0;
+                    for (idx, &count) in taxid_counts.iter().enumerate() {
+                        if count > best_count {
+                            best_count = count;
+                            best_taxid_idx = idx as u8;
+                        }
+                    }
+
+                    let best_taxid = db.true_taxid(best_taxid_idx);
+
+                    if is_paired {
+                        let _ = write!(
+                            local_output,
+                            "C\t{}\t{}\t{}|{}\t",
+                            record.header, best_taxid, seq1.len(), seq2_len
+                        );
+                    } else {
+                        let _ = write!(
+                            local_output,
+                            "C\t{}\t{}\t{}\t",
+                            record.header, best_taxid, seq1.len()
+                        );
+                    }
+
+                    write_hit_pattern(&mut local_output, &hits1, &db);
+
+                    if has_r2 {
+                        local_output.extend_from_slice(b" |:| ");
+                        write_hit_pattern(&mut local_output, &hits2, &db);
+                    }
+
+                    if acc_registry.is_some() && !acc_counts.is_empty() {
+                        local_output.push(b'\t');
+                        let reg = acc_registry.as_ref().unwrap();
+                        for (acc_id, count) in acc_counts.iter() {
+                            let _ = write!(
+                                local_output,
+                                "{}:{} ",
+                                reg.get_name(*acc_id),
+                                count
+                            );
+                        }
+                    }
+
+                    let _ = write!(local_output, "\tcov:{:.3}\n", coverage);
+                    *local_report.entry(best_taxid).or_default() += 1;
+                    classified.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
 
-        let mut chunks = output_chunks.lock().unwrap();
-        chunks.push(local_output);
+            // Write output directly
+            {
+                let mut writer = output_writer.lock().unwrap();
+                let _ = writer.write_all(&local_output);
+            }
 
-        let mut global_report = report_counts.lock().unwrap();
-        for (taxid, count) in local_report {
-            *global_report.entry(taxid).or_default() += count;
-        }
-    });
+            {
+                let mut global_report = report_counts.lock().unwrap();
+                for (taxid, count) in local_report {
+                    *global_report.entry(taxid).or_default() += count;
+                }
+            }
+        });
+    }
 
-    // Write output
+    // Wait for reader thread and propagate errors
+    match reader_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("Reader thread panicked"),
+    }
+
+    // Flush output
     {
-        let f = File::create(format!("{}.output", config.output_prefix))?;
-        let mut writer = io::BufWriter::new(f);
-        let chunks = output_chunks.into_inner().unwrap();
-        for chunk in chunks {
-            writer.write_all(&chunk)?;
-        }
+        let mut writer = output_writer.lock().unwrap();
         writer.flush()?;
     }
+
+    let num_records = total_records.load(Ordering::Relaxed);
 
     // Write report
     {
@@ -282,7 +313,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
         writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
         for (taxid, count) in &sorted {
-            let ratio = if num_records as f64 > 0.0 { *count as f64 / num_records as f64 } else { 0.0 };
+            let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
             writeln!(writer, "{}\t{}\t{:0.3}", taxid, count, ratio)?;
         }
         writer.flush()?;
@@ -299,14 +330,16 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", num_records);
-    eprintln!("Load time:    {:.2}s", load_elapsed.as_secs_f64());
-    eprintln!("Classify time:{:.2}s", elapsed.as_secs_f64());
-    eprintln!("Total time:   {:.2}s", load_elapsed.as_secs_f64() + elapsed.as_secs_f64());
-
+    eprintln!("Time:         {:.2}s", elapsed.as_secs_f64());
+    if elapsed.as_secs_f64() > 0.0 {
+        eprintln!(
+            "Throughput:   {:.0} reads/s",
+            num_records as f64 / elapsed.as_secs_f64()
+        );
+    }
     Ok(())
 }
 
-/// Write run-length encoded hit pattern for one end directly into a byte buffer.
 fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
     if hits.is_empty() {
         out.extend_from_slice(b"0:0");
@@ -337,26 +370,35 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
     let _ = write!(out, "{}:{}", current_taxid, run_len);
 }
 
-fn read_sequences(path: &str) -> Result<Vec<FastqRecord>> {
-    use needletail::parse_fastx_file;
+type FastxReader = Box<dyn needletail::FastxReader + Send>;
 
-    let mut records = Vec::new();
-    let mut reader = parse_fastx_file(path)
+fn open_fastx(path: &str) -> Result<FastxReader> {
+    let reader = needletail::parse_fastx_file(path)
         .map_err(|e| anyhow::anyhow!("Cannot open reads file {}", e))?;
+    Ok(reader)
+}
 
-    while let Some(result) = reader.next() {
-        let rec = result.map_err(|e| anyhow::anyhow!("Not sure what is going on, but cant read records in {}", e))?;
+// Read up to n records from the reader, and returns empty vec at EOF
+fn read_chunk(reader: &mut FastxReader, n: usize) -> Result<Vec<FastqRecord>> {
+    let mut records = Vec::with_capacity(n);
 
-        let header = std::str::from_utf8(rec.id())
-            .unwrap_or("")
-            .to_string();
+    for _ in 0..n {
+        match reader.next() {
+            Some(Ok(rec)) => {
+                let header = std::str::from_utf8(rec.id())
+                    .unwrap_or("")
+                    .to_string();
 
-        let sequence = std::str::from_utf8(&rec.seq())
-            .unwrap_or("")
-            .to_uppercase();
+                let sequence = std::str::from_utf8(&rec.seq())
+                    .unwrap_or("")
+                    .to_uppercase();
 
-        if !sequence.is_empty() {
-            records.push(FastqRecord { header, sequence });
+                if !sequence.is_empty() {
+                    records.push(FastqRecord { header, sequence });
+                }
+            }
+            Some(Err(e)) => return Err(anyhow::anyhow!("Not sure what the error is but can't read records {}", e)),
+            None => break,
         }
     }
 
