@@ -82,8 +82,29 @@ impl AccessionRegistry {
             id_to_name,
         })
     }
-}
+    
+    //I think this can for sure be refactored with that fn load
+    pub fn load_for_query(path: &str) -> Result<Self> {
+        let file = File::open(path).context("Cannot open accession registry")?;
+        let reader = BufReader::new(file);
+        let mut id_to_name = Vec::new();
 
+        let mut lines = reader.lines();
+        lines.next(); // skip header
+
+        for line in lines {
+            let line = line?;
+            if let Some(tab_pos) = line.find('\t') {
+                id_to_name.push(line[tab_pos + 1..].to_string());
+            }
+        }
+
+        Ok(Self {
+            name_to_id: HashMap::new(),
+            id_to_name,
+        })
+    }
+}
 
 /// CSR storage for variable-length accession lists per minimizer
 pub struct CsrAccessions {

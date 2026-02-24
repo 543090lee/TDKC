@@ -47,7 +47,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     let acc_path = format!("{}.accessions", config.db_prefix);
     let acc_registry = if config.use_accessions {
-        match AccessionRegistry::load(&acc_path) {
+        match AccessionRegistry::load_for_query(&acc_path) {
             Ok(reg) => Some(reg),
             Err(_) => {
                 eprintln!("No accession registry found, skipping accession output");
@@ -85,6 +85,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     // literally writer thread will act as a mutex, but without contention
     let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize)> {
+
+        //now we dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
+        //when it;s full
         let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
         let mut global_report: HashMap<u32, usize> = HashMap::new();
 
@@ -110,8 +113,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let batch_size = 5_000;
 
     // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
-    // grab one batch whenever it's free, so no contention like before, where if one thread slow, then all had 
-    // to wait before starting on the nextc chunk
+    // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
+    // to wait before starting on the nextc chunk (mpsc)
 
     let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
 
