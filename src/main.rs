@@ -4,12 +4,13 @@ mod fasta_index;
 mod minimizer;
 mod query;
 mod taxonomy;
+mod utils;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "kmer-db")]
-#[command(about = "Distilled k-mer classifier")]
+#[command(about = "Target Distilled K-mer Classifier")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]

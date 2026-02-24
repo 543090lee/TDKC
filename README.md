@@ -19,7 +19,9 @@ Think about how fulgor does accession/color tracking, since in case if a majorit
 
 ~~SIMD vectorization~~
 
-stream FASTQ not load all at once
+~~stream FASTQ not load all at once~~
+
+reasoning on why to use 30% coverage, maybe compare it to kraken2 how they look at actual minimizer sampling
 
 mmap
 
