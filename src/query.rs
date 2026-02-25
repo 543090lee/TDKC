@@ -43,6 +43,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .num_threads(config.threads)
         .build_global()
         .ok();
+
+    let db_start = std::time::Instant::now();
+
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
     let coverage_threshold = config.coverage_threshold;
 
@@ -66,6 +69,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         db.toggle_mask,
     );
 
+    let db_elapsed = db_start.elapsed();
+
     let is_paired = config.read2_file.is_some();
 
     if is_paired {
@@ -74,7 +79,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         eprintln!("Running single-end reads");
     }
 
-    let start = std::time::Instant::now();
+    let classify_start = std::time::Instant::now();
 
     // thread only to write, no lock, so less overhead
     let output_file = File::create(format!("{}.output", config.output_prefix))?;
@@ -160,6 +165,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         Err(_) => anyhow::bail!("Reader thread panicked"),
     }
 
+    let classify_elapsed = classify_start.elapsed();
+
     // Write report
     {
         let f = File::create(format!("{}.report", config.output_prefix))?;
@@ -176,8 +183,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         writer.flush()?;
     }
 
-    let elapsed = start.elapsed();
-
     if c + u != num_records {
         eprintln!("Warning C+U is not adding up to number of reads");
     }
@@ -185,11 +190,13 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     eprintln!("Classified:   {}", c);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", num_records);
-    eprintln!("Time:         {:.2}s", elapsed.as_secs_f64());
-    if elapsed.as_secs_f64() > 0.0 {
+    eprintln!("DB load:      {:.2}s", db_elapsed.as_secs_f64());
+    eprintln!("Classify:     {:.2}s", classify_elapsed.as_secs_f64());
+    eprintln!("Total time:   {:.2}s", db_elapsed.as_secs_f64() + classify_elapsed.as_secs_f64());
+    if classify_elapsed.as_secs_f64() > 0.0 {
         eprintln!(
             "Throughput:   {:.0} reads/s",
-            num_records as f64 / elapsed.as_secs_f64()
+            num_records as f64 / classify_elapsed.as_secs_f64()
         );
     }
     Ok(())
@@ -345,6 +352,7 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
     let mut run_len: u32 = 1;
 
     let mut current_acc = &hits[0].accessions;
+    let reg = acc_registry.as_ref();
 
     for hit in hits.iter().skip(1) {
         let t = if hit.is_hit {
@@ -355,10 +363,13 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
         if t == current_taxid {
             run_len += 1;
         } else {
-            if acc_registry.is_some() && current_taxid != 0 {
-                let reg = acc_registry.as_ref().unwrap();
-                let mut acc_str = current_acc.iter().map(|id| reg.get_name(*id)).join(",");
-                let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+            if let Some(r) = reg {
+                if current_taxid != 0 {
+                    let acc_str = current_acc.iter().map(|id| r.get_name(*id)).join(",");
+                    let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+                } else {
+                    let _ = write!(out, "{}:{} ", current_taxid, run_len);
+                }
             } else {
                 let _ = write!(out, "{}:{} ", current_taxid, run_len);
             }
@@ -367,10 +378,13 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
             run_len = 1;
         }
     }
-    if acc_registry.is_some() && current_taxid != 0 {
-        let reg = acc_registry.as_ref().unwrap();
-        let mut acc_str = current_acc.iter().map(|id| reg.get_name(*id)).join(",");
-        let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+    if let Some(r) = reg {
+        if current_taxid != 0 {
+            let acc_str = current_acc.iter().map(|id| r.get_name(*id)).join(",");
+            let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+        } else {
+            let _ = write!(out, "{}:{} ", current_taxid, run_len);
+        }
     } else {
         let _ = write!(out, "{}:{} ", current_taxid, run_len);
     }

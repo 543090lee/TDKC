@@ -82,7 +82,7 @@ impl AccessionRegistry {
             id_to_name,
         })
     }
-    
+
     //I think this can for sure be refactored with that fn load
     pub fn load_for_query(path: &str) -> Result<Self> {
         let file = File::open(path).context("Cannot open accession registry")?;
@@ -152,11 +152,9 @@ impl CsrAccessions {
         let data_len = self.data.len() as u64;
         f.write_all(&data_len.to_le_bytes())?;
 
-        // Write offsets
         for &off in &self.offsets {
             f.write_all(&off.to_le_bytes())?;
         }
-        // Write data
         for &acc in &self.data {
             f.write_all(&acc.to_le_bytes())?;
         }
@@ -164,25 +162,33 @@ impl CsrAccessions {
     }
 
     pub fn load(path: &str) -> Result<Self> {
-        let raw = std::fs::read(path).context("Cannot read CSR accession file")?;
+        let mut f = File::open(path).context("Cannot read CSR accession file")?;
+        let mut buf8 = [0u8; 8];
 
-        let num_elements = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
-        let data_len = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
+        f.read_exact(&mut buf8)?;
+        let num_elements = u64::from_le_bytes(buf8) as usize;
+        f.read_exact(&mut buf8)?;
+        let data_len = u64::from_le_bytes(buf8) as usize;
 
-        let offsets_bytes = &raw[16..16 + (num_elements + 1) * 4];
-        let offsets: Vec<u32> = offsets_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut offsets = vec![0u32; num_elements + 1];
+        let offsets_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                offsets.as_mut_ptr() as *mut u8,
+                (num_elements + 1) * 4,
+            )
+        };
+        f.read_exact(offsets_bytes)?;
 
-        let data_start = 16 + (num_elements + 1) * 4;
-        let data_bytes = &raw[data_start..data_start + data_len * 4];
-        let acc_data: Vec<u32> = data_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut data = vec![0u32; data_len];
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                data.as_mut_ptr() as *mut u8,
+                data_len * 4,
+            )
+        };
+        f.read_exact(data_bytes)?;
 
-        Ok(Self { offsets, data: acc_data })
+        Ok(Self { offsets, data })
     }
 }
 
@@ -288,7 +294,7 @@ impl KmerDatabase {
             f.write_all(&[has_acc])?;
         }
 
-        // MPHF (here i used bincode for serde)
+        // MPHF
         {
             let encoded = bincode::serialize(&self.mphf)?;
             std::fs::write(format!("{}.mphf", prefix), &encoded)?;
@@ -333,7 +339,6 @@ impl KmerDatabase {
         Ok(())
     }
 
-    /// Load from disk.
     pub fn load(prefix: &str, load_accessions: bool) -> Result<Self> {
         eprintln!("Loading database from {}", prefix);
 
@@ -368,14 +373,19 @@ impl KmerDatabase {
             bincode::deserialize(&data)?
         };
 
-        // Fingerprints
+        // Fingerprints — read directly into Vec<u16>, no intermediate Vec<u8>
         let fingerprints = {
-            let data = std::fs::read(format!("{}.fp", prefix))
-                .context("Cannot read .fp file")?;
-            assert_eq!(data.len(), num_minimizers * 2, ".fp file size mismatch");
-            data.chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect::<Vec<u16>>()
+            let mut f = File::open(format!("{}.fp", prefix))
+                .context("Cannot open .fp file")?;
+            let mut fp = vec![0u16; num_minimizers];
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts_mut(
+                    fp.as_mut_ptr() as *mut u8,
+                    num_minimizers * 2,
+                )
+            };
+            f.read_exact(byte_slice)?;
+            fp
         };
 
         // TaxID indices
@@ -387,15 +397,22 @@ impl KmerDatabase {
             v
         };
 
-        // TaxID mapping
+        // TaxID mapping — read directly into Vec<u32>
         let index_to_taxid = {
-            let data = std::fs::read(format!("{}.taxmap", prefix))
-                .context("Cannot read .taxmap file")?;
-            let sz = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-            assert_eq!(data.len(), 8 + sz * 4, ".taxmap file size mismatch");
-            data[8..].chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect::<Vec<u32>>()
+            let mut f = File::open(format!("{}.taxmap", prefix))
+                .context("Cannot open .taxmap file")?;
+            let mut buf8 = [0u8; 8];
+            f.read_exact(&mut buf8)?;
+            let sz = u64::from_le_bytes(buf8) as usize;
+            let mut v = vec![0u32; sz];
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts_mut(
+                    v.as_mut_ptr() as *mut u8,
+                    sz * 4,
+                )
+            };
+            f.read_exact(byte_slice)?;
+            v
         };
 
         let acc_path = format!("{}.accession", prefix);
@@ -404,6 +421,7 @@ impl KmerDatabase {
         } else {
             None
         };
+
         Ok(Self {
             k,
             l,
@@ -486,7 +504,6 @@ impl KmerDatabaseBuilder {
             self.toggle_mask,
         );
 
-        // minimizer → (taxid_index, Set<accession_id>)
         struct MinimizerInfo {
             taxid_idx: u8,
             accessions: HashSet<u32>,
@@ -501,7 +518,6 @@ impl KmerDatabaseBuilder {
                     taxid_idx,
                     accessions: HashSet::new(),
                 });
-                // Keep first taxid seen (deterministic)
                 if let Some(acc_id) = kmer.accession_id {
                     entry.accessions.insert(acc_id);
                 }
