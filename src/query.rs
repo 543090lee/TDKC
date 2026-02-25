@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use crate::database::{AccessionRegistry, KmerDatabase, Hit};
 use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
+use itertools::Itertools;
 
 pub struct QueryConfig {
     pub db_prefix: String,
@@ -31,7 +32,7 @@ struct ReadBatch {
 // this goes to writer thread
 struct BatchResult {
     output_data: Vec<u8>,
-    report_counts: HashMap<u32, usize>,
+    report_counts: FxHashMap<u32, usize>,
     classified: usize,
     unclassified: usize,
     num_records: usize,
@@ -208,7 +209,7 @@ fn classify_batch(
 ) -> BatchResult {
     let batch_len = batch.records1.len();
     let mut local_output: Vec<u8> = Vec::with_capacity(batch_len * 200);
-    let mut local_report: HashMap<u32, usize> = HashMap::new();
+    let mut local_report: FxHashMap<u32, usize> = FxHashMap::default();
     let mut local_classified: usize = 0;
     let mut local_unclassified: usize = 0;
 
@@ -216,7 +217,6 @@ fn classify_batch(
     let mut hits2: Vec<Hit> = Vec::new();
     let mut minimizer_buf1: Vec<u64> = Vec::new();
     let mut minimizer_buf2: Vec<u64> = Vec::new();
-    let mut acc_counts: FxHashMap<u32, usize> = FxHashMap::default();
 
     for i in 0..batch_len {
         let record = &batch.records1[i];
@@ -245,17 +245,11 @@ fn classify_batch(
 
         let mut valid_hits: usize = 0;
         let mut taxid_counts = [0u32; 256];
-        acc_counts.clear();
 
         for hit in hits1.iter() {
             if hit.is_hit {
                 valid_hits += 1;
                 taxid_counts[hit.taxid_idx as usize] += 1;
-                if acc_registry.is_some() {
-                    for &acc in hit.accessions {
-                        *acc_counts.entry(acc).or_default() += 1;
-                    }
-                }
             }
         }
 
@@ -264,11 +258,6 @@ fn classify_batch(
                 if hit.is_hit {
                     valid_hits += 1;
                     taxid_counts[hit.taxid_idx as usize] += 1;
-                    if acc_registry.is_some() {
-                        for &acc in hit.accessions {
-                            *acc_counts.entry(acc).or_default() += 1;
-                        }
-                    }
                 }
             }
         }
@@ -320,24 +309,11 @@ fn classify_batch(
                 );
             }
 
-            write_hit_pattern(&mut local_output, &hits1, db);
+            write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
 
             if has_r2 {
                 local_output.extend_from_slice(b" |:| ");
-                write_hit_pattern(&mut local_output, &hits2, db);
-            }
-
-            if acc_registry.is_some() && !acc_counts.is_empty() {
-                local_output.push(b'\t');
-                let reg = acc_registry.as_ref().unwrap();
-                for (acc_id, count) in acc_counts.iter() {
-                    let _ = write!(
-                        local_output,
-                        "{}:{} ",
-                        reg.get_name(*acc_id),
-                        count
-                    );
-                }
+                write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
             }
 
             let _ = write!(local_output, "\tcov:{:.3}\n", coverage);
@@ -355,7 +331,7 @@ fn classify_batch(
     }
 }
 
-fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
+fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_registry: &Option<AccessionRegistry>) {
     if hits.is_empty() {
         out.extend_from_slice(b"0:0");
         return;
@@ -368,6 +344,8 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
     };
     let mut run_len: u32 = 1;
 
+    let mut current_acc = &hits[0].accessions;
+
     for hit in hits.iter().skip(1) {
         let t = if hit.is_hit {
             db.true_taxid(hit.taxid_idx)
@@ -377,12 +355,25 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase) {
         if t == current_taxid {
             run_len += 1;
         } else {
-            let _ = write!(out, "{}:{} ", current_taxid, run_len);
+            if acc_registry.is_some() && current_taxid != 0 {
+                let reg = acc_registry.as_ref().unwrap();
+                let mut acc_str = current_acc.iter().map(|id| reg.get_name(*id)).join(",");
+                let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+            } else {
+                let _ = write!(out, "{}:{} ", current_taxid, run_len);
+            }
             current_taxid = t;
+            current_acc = &hit.accessions;
             run_len = 1;
         }
     }
-    let _ = write!(out, "{}:{}", current_taxid, run_len);
+    if acc_registry.is_some() && current_taxid != 0 {
+        let reg = acc_registry.as_ref().unwrap();
+        let mut acc_str = current_acc.iter().map(|id| reg.get_name(*id)).join(",");
+        let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
+    } else {
+        let _ = write!(out, "{}:{} ", current_taxid, run_len);
+    }
 }
 
 fn read_single_batches(
