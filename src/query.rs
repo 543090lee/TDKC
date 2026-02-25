@@ -43,7 +43,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .num_threads(config.threads)
         .build_global()
         .ok();
-    let db = KmerDatabase::load(&config.db_prefix)?;
+    let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
     let coverage_threshold = config.coverage_threshold;
 
     let acc_path = format!("{}.accessions", config.db_prefix);

@@ -334,7 +334,7 @@ impl KmerDatabase {
     }
 
     /// Load from disk.
-    pub fn load(prefix: &str) -> Result<Self> {
+    pub fn load(prefix: &str, load_accessions: bool) -> Result<Self> {
         eprintln!("Loading database from {}", prefix);
 
         // Meta
@@ -399,7 +399,7 @@ impl KmerDatabase {
         };
 
         let acc_path = format!("{}.accession", prefix);
-        let accessions = if has_acc && Path::new(&acc_path).exists() {
+        let accessions = if load_accessions && has_acc && Path::new(&acc_path).exists() {
             Some(CsrAccessions::load(&acc_path)?)
         } else {
             None
