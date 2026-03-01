@@ -96,7 +96,7 @@ fn extract_kmers_from_kraken(
 
     // Read all lines into batches for parallel processing
     let lines: Vec<String> = reader.lines().collect::<std::io::Result<Vec<_>>>()?;
-    eprintln!("Processing {} reads", lines.len());
+    eprintln!("Processing {} Sequences", lines.len());
 
     let batch_size = 50_000;
     let all_kmers: Mutex<Vec<ExtractedKmer>> = Mutex::new(Vec::new());
