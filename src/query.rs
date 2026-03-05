@@ -338,6 +338,7 @@ fn classify_batch(
     }
 }
 
+// resolve accessions lazily from class_id only when writing output
 fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_registry: &Option<AccessionRegistry>) {
     if hits.is_empty() {
         out.extend_from_slice(b"0:0");
@@ -351,7 +352,7 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
     };
     let mut run_len: u32 = 1;
 
-    let mut current_acc = &hits[0].accessions;
+    let mut current_class_id = hits[0].accession_class_id;
     let reg = acc_registry.as_ref();
 
     for hit in hits.iter().skip(1) {
@@ -363,31 +364,38 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
         if t == current_taxid {
             run_len += 1;
         } else {
-            if let Some(r) = reg {
-                if current_taxid != 0 {
-                    let acc_str = current_acc.iter().map(|id| r.get_name(*id)).join(",");
-                    let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
-                } else {
-                    let _ = write!(out, "{}:{} ", current_taxid, run_len);
-                }
-            } else {
-                let _ = write!(out, "{}:{} ", current_taxid, run_len);
-            }
+            emit_run(out, current_taxid, run_len, current_class_id, reg, db);
             current_taxid = t;
-            current_acc = &hit.accessions;
+            current_class_id = hit.accession_class_id;
             run_len = 1;
         }
     }
+    emit_run(out, current_taxid, run_len, current_class_id, reg, db);
+}
+
+#[inline]
+fn emit_run(
+    out: &mut Vec<u8>,
+    taxid: u32,
+    run_len: u32,
+    class_id: Option<u32>,
+    reg: Option<&AccessionRegistry>,
+    db: &KmerDatabase,
+) {
     if let Some(r) = reg {
-        if current_taxid != 0 {
-            let acc_str = current_acc.iter().map(|id| r.get_name(*id)).join(",");
-            let _ = write!(out, "{}-{{{}}}:{} ", current_taxid, acc_str, run_len);
-        } else {
-            let _ = write!(out, "{}:{} ", current_taxid, run_len);
+        if taxid != 0 {
+            if let Some(cid) = class_id {
+                // Only decode accessions here — this is the only place we need the actual names
+                let accs = db.resolve_accessions(cid);
+                if !accs.is_empty() {
+                    let acc_str = accs.iter().map(|id| r.get_name(*id)).join(",");
+                    let _ = write!(out, "{}-{{{}}}:{} ", taxid, acc_str, run_len);
+                    return;
+                }
+            }
         }
-    } else {
-        let _ = write!(out, "{}:{} ", current_taxid, run_len);
     }
+    let _ = write!(out, "{}:{} ", taxid, run_len);
 }
 
 fn read_single_batches(

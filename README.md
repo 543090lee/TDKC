@@ -7,7 +7,6 @@ TODO:
 add an option/parameter where if you do --consensus/no-fp then when we build, we look at accession information, and based on how well it's distributed or hitting many same targets, we include it or not.
 Good idea
 
-We dont need to index every sequence in the fasta file. only the ones that have target kmers.
 
 ~~make load and writing bulk, minimize write_all : loead is now fixed, maybe faster write~~
 
@@ -17,18 +16,15 @@ We dont need to index every sequence in the fasta file. only the ones that have 
 
 ~~it probably has to be streamlined i think, for writing output file. kinda inefficient i think~~
 
-Think about how fulgor does accession/color tracking, since in case if a majority of kmers are conserved then, RIP
-
 ~~SIMD vectorization~~
 
 ~~stream FASTQ not load all at once~~
 
-reasoning on why to use 30% coverage, maybe compare it to kraken2 how they look at actual minimizer sampling
+~~reasoning on why to use 30% coverage, maybe compare it to kraken2 how they look at actual minimizer sampling~~
 
-mmap
 
-critical error in database building, like k-mer level dedup which meant if the same k-mer appeared in sequences A and B, only A's accession made it. 
+~~bro i dont know what to do when a minimizer gets two different taxid when extracting from kraken2 output~~
 
-CSR is kinda bad : 3.6G, so use equivalence class , delta+ VByte encoding, and maybe cite Pibiri, G. E., & Venturini, R. (2019). Techniques for Inverted Index Compression.
+maybe make read threshold (k-l+1)/(read length-k + 1)
 
-bro i dont know what to do when a minimizer gets two different taxid when extracting from kraken2 output
+it seems like accession information like when it's 12059:7, right now our query.rs is outputting only the hit.accessions of the first 12059 hit from that long run...

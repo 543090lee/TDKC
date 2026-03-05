@@ -1,6 +1,5 @@
 mod build;
 mod database;
-mod fasta_index;
 mod minimizer;
 mod query;
 mod taxonomy;

@@ -12,17 +12,6 @@ fn base_code(c: u8) -> u8 {
     }
 }
 
-// This is only used for the first rc compute
-#[inline(always)]
-fn revcomp(mut kmer: u64, n: usize) -> u64 {
-    kmer = ((kmer & 0xCCCC_CCCC_CCCC_CCCC) >> 2) | ((kmer & 0x3333_3333_3333_3333) << 2);
-    kmer = ((kmer & 0xF0F0_F0F0_F0F0_F0F0) >> 4) | ((kmer & 0x0F0F_0F0F_0F0F_0F0F) << 4);
-    kmer = ((kmer & 0xFF00_FF00_FF00_FF00) >> 8) | ((kmer & 0x00FF_00FF_00FF_00FF) << 8);
-    kmer = ((kmer & 0xFFFF_0000_FFFF_0000) >> 16) | ((kmer & 0x0000_FFFF_0000_FFFF) << 16);
-    kmer = (kmer >> 32) | (kmer << 32);
-    ((!kmer) >> (64 - n * 2)) & ((1u64 << (n * 2)) - 1)
-}
-
 pub struct MinimizerScanner {
     k: usize,
     l: usize,
@@ -129,32 +118,10 @@ impl MinimizerScanner {
         }
     }
 
-    pub fn scan(&self, seq: &[u8]) -> Vec<u64> {
-        let mut out = Vec::new();
-        self.scan_into(seq, &mut out);
-        out
-    }
-
-    pub fn first_minimizer(&self, seq: &[u8]) -> Option<u64> {
-        let mins = self.scan(seq);
-        mins.into_iter().next()
-    }
-
     pub fn k(&self) -> usize {
         self.k
     }
-
-    pub fn l(&self) -> usize {
-        self.l
-    }
-
-    pub fn spaced_seed_mask(&self) -> u64 {
-        self.spaced_seed_mask
-    }
-
-    pub fn toggle_mask(&self) -> u64 {
-        self.toggle_mask
-    }
+    
 }
 
 // spaced seed mask from a bit pattern string like "1111111111111111111110101010101"

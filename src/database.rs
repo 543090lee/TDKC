@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use boomphf::Mphf;
+use rustc_hash::FxHashMap;
 
 #[inline]
 fn compute_fingerprint(mut kmer: u64) -> u16 {
@@ -14,7 +15,75 @@ fn compute_fingerprint(mut kmer: u64) -> u16 {
     (kmer & 0xFFFF) as u16
 }
 
-/// Maps accession names ↔ compact u32 IDs.
+#[inline]
+fn hash_slice(slice: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    slice.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[inline]
+pub fn vbyte_encode(mut val: u32, out: &mut Vec<u8>) {
+    loop {
+        if val < 0x80 {
+            out.push(val as u8);
+            return;
+        }
+        out.push((val as u8 & 0x7F) | 0x80);
+        val >>= 7;
+    }
+}
+
+#[inline]
+pub fn vbyte_decode(data: &[u8], pos: &mut usize) -> u32 {
+    let mut val: u32 = 0;
+    let mut shift = 0;
+    loop {
+        let b = data[*pos];
+        *pos += 1;
+        val |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            return val;
+        }
+        shift += 7;
+    }
+}
+
+pub fn delta_vbyte_encode(sorted_ids: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    vbyte_encode(sorted_ids.len() as u32, &mut out);
+    let mut prev = 0u32;
+    for &id in sorted_ids {
+        vbyte_encode(id - prev, &mut out);
+        prev = id;
+    }
+    out
+}
+
+pub fn delta_vbyte_decode(data: &[u8], pos: &mut usize) -> Vec<u32> {
+    let count = vbyte_decode(data, pos) as usize;
+    let mut result = Vec::with_capacity(count);
+    let mut prev = 0u32;
+    for _ in 0..count {
+        let delta = vbyte_decode(data, pos);
+        prev += delta;
+        result.push(prev);
+    }
+    result
+}
+
+#[inline]
+pub fn delta_vbyte_skip(data: &[u8], pos: &mut usize) {
+    let count = vbyte_decode(data, pos) as usize;
+    for _ in 0..count {
+        while data[*pos] & 0x80 != 0 {
+            *pos += 1;
+        }
+        *pos += 1;
+    }
+}
+
 pub struct AccessionRegistry {
     name_to_id: HashMap<String, u32>,
     id_to_name: Vec<String>,
@@ -39,10 +108,7 @@ impl AccessionRegistry {
     }
 
     pub fn get_name(&self, id: u32) -> &str {
-        self.id_to_name
-            .get(id as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown")
+        self.id_to_name.get(id as usize).map(|s| s.as_str()).unwrap_or("Unknown")
     }
 
     pub fn len(&self) -> usize {
@@ -50,46 +116,21 @@ impl AccessionRegistry {
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
-        let mut f = File::create(path)?;
-        writeln!(f, "ID\tAccession")?;
+        let mut w = BufWriter::new(File::create(path)?);
+        writeln!(w, "ID\tAccession")?;
         for (i, name) in self.id_to_name.iter().enumerate() {
-            writeln!(f, "{}\t{}", i, name)?;
+            writeln!(w, "{}\t{}", i, name)?;
         }
-        Ok(())
+        w.flush().map_err(Into::into)
     }
 
-    pub fn load(path: &str) -> Result<Self> {
-        let file = File::open(path).context("Cannot open accession registry")?;
-        let reader = BufReader::new(file);
-        let mut id_to_name = Vec::new();
-        let mut name_to_id = HashMap::new();
-
-        let mut lines = reader.lines();
-        lines.next(); // skip header
-
-        for line in lines {
-            let line = line?;
-            if let Some(tab_pos) = line.find('\t') {
-                let name = line[tab_pos + 1..].to_string();
-                let id = id_to_name.len() as u32;
-                name_to_id.insert(name.clone(), id);
-                id_to_name.push(name);
-            }
-        }
-
-        Ok(Self {
-            name_to_id,
-            id_to_name,
-        })
-    }
-
-    //I think this can for sure be refactored with that fn load
+    /// Load only id→name (skips name→id map; used during query).
     pub fn load_for_query(path: &str) -> Result<Self> {
-        let file = File::open(path).context("Cannot open accession registry")?;
-        let reader = BufReader::new(file);
         let mut id_to_name = Vec::new();
 
-        let mut lines = reader.lines();
+        let mut lines = BufReader::new(
+            File::open(path).context("Cannot open accession registry")?
+        ).lines();
         lines.next(); // skip header
 
         for line in lines {
@@ -98,99 +139,364 @@ impl AccessionRegistry {
                 id_to_name.push(line[tab_pos + 1..].to_string());
             }
         }
+        Ok(Self { name_to_id: HashMap::new(), id_to_name })
+    }
+}
+
+/// Uses a bitset to mark which MPHF indices have accessions, a precomputed
+/// rank table to map sparse index → dense position, and a dense array of
+/// class IDs. This replaces the old FxHashMap approach and saves hundreds of
+/// MB of RAM for large databases 
+/// Number of bits per rank block. One cached rank entry per this many bits.
+const RANK_BLOCK_BITS: usize = 512;
+const RANK_BLOCK_WORDS: usize = RANK_BLOCK_BITS / 64; // 8 u64 words per block
+
+pub struct EqClassAccessions {
+    /// Bitset: 1 bit per MPHF index. Set if that index has accessions.
+    bitset: Vec<u64>,
+    /// Precomputed popcount prefix sums. rank_cache[i] = number of set bits
+    /// in bitset[0 .. i*RANK_BLOCK_WORDS].
+    rank_cache: Vec<u32>,
+    /// Dense class IDs: only entries whose bit is set get a slot here.
+    dense_ids: Vec<u32>,
+    /// Total number of MPHF slots (needed for sizing on save).
+    num_slots: usize,
+    /// Byte offsets into blob for each class.
+    offsets: Vec<u32>,
+    /// VByte-encoded accession lists, one per class.
+    blob: Vec<u8>,
+    pub num_classes: usize,
+}
+
+impl EqClassAccessions {
+    pub fn new_empty(num_slots: usize) -> Self {
+        let num_words = (num_slots + 63) / 64;
+        // Class 0 = "no accessions" (implicit for any index not in the set)
+        let encoded_empty = delta_vbyte_encode(&[]);
+        Self {
+            bitset: vec![0u64; num_words],
+            rank_cache: Vec::new(), // built at finalize
+            dense_ids: Vec::new(),
+            num_slots,
+            offsets: vec![0u32],
+            blob: encoded_empty,
+            num_classes: 1,
+        }
+    }
+
+    /// Build the rank_cache from the bitset. Must be called after all
+    /// add_accessions() calls, before any get queries.
+    fn build_rank_cache(&mut self) {
+        let num_blocks = (self.bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
+        self.rank_cache = Vec::with_capacity(num_blocks + 1);
+        let mut cumulative: u32 = 0;
+        for block in 0..num_blocks {
+            self.rank_cache.push(cumulative);
+            let start = block * RANK_BLOCK_WORDS;
+            let end = (start + RANK_BLOCK_WORDS).min(self.bitset.len());
+            for w in start..end {
+                cumulative += self.bitset[w].count_ones();
+            }
+        }
+        self.rank_cache.push(cumulative); // sentinel
+    }
+
+    /// Compute rank(idx): number of set bits before position `idx`.
+    #[inline]
+    fn rank(&self, idx: usize) -> usize {
+        let word = idx / 64;
+        let bit = idx % 64;
+        let block = word / RANK_BLOCK_WORDS;
+        let mut r = self.rank_cache[block] as usize;
+        let block_start = block * RANK_BLOCK_WORDS;
+        for w in block_start..word {
+            r += self.bitset[w].count_ones() as usize;
+        }
+        if bit > 0 {
+            r += (self.bitset[word] & ((1u64 << bit) - 1)).count_ones() as usize;
+        }
+        r
+    }
+
+    /// Check if bit is set at position idx.
+    #[inline]
+    fn has_bit(&self, idx: usize) -> bool {
+        let word = idx / 64;
+        let bit = idx % 64;
+        if word >= self.bitset.len() {
+            return false;
+        }
+        self.bitset[word] & (1u64 << bit) != 0
+    }
+
+    /// Set bit at position idx.
+    #[inline]
+    fn set_bit(&mut self, idx: usize) {
+        let word = idx / 64;
+        let bit = idx % 64;
+        self.bitset[word] |= 1u64 << bit;
+    }
+
+    /// Returns true if the stored class matches `acc_list` exactly.
+    fn matches(&self, class_id: u32, acc_list: &[u32]) -> bool {
+        let mut pos = self.offsets[class_id as usize] as usize;
+        let count = vbyte_decode(&self.blob, &mut pos) as usize;
+        if count != acc_list.len() {
+            return false;
+        }
+        let mut prev = 0u32;
+        for &expected in acc_list {
+            let delta = vbyte_decode(&self.blob, &mut pos);
+            prev += delta;
+            if prev != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// During build: record accessions for MPHF index idx
+    /// Bits are set immediately; dense_ids is built via finalize_for_save
+    ///
+    /// During build we temporarily store class IDs in a side hashmap keyed by
+    /// idx, then pack them into dense_ids in finalize_for_save
+    /// We use a temporary FxHashMap<u32, u32> (idx -> class_id) during build
+    /// only, which is dropped before save.
+    pub fn add_accessions(
+        &mut self,
+        idx: usize,
+        acc_list: &[u32],
+        hash_to_class: &mut FxHashMap<u64, u32>,
+        build_map: &mut FxHashMap<u32, u32>,
+    ) {
+        if acc_list.is_empty() {
+            return;
+        }
+
+        let mut h = hash_slice(acc_list);
+        let class_id = loop {
+            match hash_to_class.get(&h) {
+                Some(&id) => {
+                    if self.matches(id, acc_list) {
+                        break id;
+                    }
+                    // Hash collision — linear probe
+                    h = h.wrapping_add(0x9E3779B97F4A7C15);
+                }
+                None => {
+                    let id = self.num_classes as u32;
+                    self.offsets.push(self.blob.len() as u32);
+                    self.blob.extend_from_slice(&delta_vbyte_encode(acc_list));
+                    hash_to_class.insert(h, id);
+                    self.num_classes += 1;
+                    break id;
+                }
+            }
+        };
+
+        self.set_bit(idx);
+        build_map.insert(idx as u32, class_id);
+    }
+
+    /// After all add_accessions calls: pack the temporary build_map into the
+    /// dense_ids array ordered by bitset position, then build the rank cache.
+    /// The build_map is consumed (dropped) to free memory.
+    pub fn finalize_for_save(&mut self, build_map: FxHashMap<u32, u32>) {
+        // Count set bits to size dense_ids
+        let total_set: usize = self.bitset.iter().map(|w| w.count_ones() as usize).sum();
+        self.dense_ids = vec![0u32; total_set];
+
+        // Walk bitset in order, assign dense positions
+        let mut dense_pos = 0usize;
+        for word_idx in 0..self.bitset.len() {
+            let mut word = self.bitset[word_idx];
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let idx = word_idx * 64 + bit;
+                if let Some(&class_id) = build_map.get(&(idx as u32)) {
+                    self.dense_ids[dense_pos] = class_id;
+                }
+                dense_pos += 1;
+                word &= word - 1; // clear lowest set bit
+            }
+        }
+
+        self.build_rank_cache();
+    }
+
+    /// Look up the equivalence class ID for a given MPHF index.
+    /// Returns None if this minimizer has no accessions.
+    #[inline]
+    pub fn get_class_id(&self, idx: usize) -> Option<u32> {
+        if !self.has_bit(idx) {
+            return None;
+        }
+        let dense_pos = self.rank(idx);
+        Some(self.dense_ids[dense_pos])
+    }
+
+    /// Decode the accession IDs for a given class ID.
+    pub fn decode_class(&self, class_id: u32) -> Vec<u32> {
+        let cid = class_id as usize;
+        if cid == 0 || cid >= self.num_classes {
+            return Vec::new();
+        }
+        let mut pos = self.offsets[cid] as usize;
+        delta_vbyte_decode(&self.blob, &mut pos)
+    }
+
+    pub fn save(&self, path: &str) -> Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+
+        // Header
+        let num_entries = self.dense_ids.len() as u64;
+        let num_classes = self.num_classes as u64;
+        let num_slots = self.num_slots as u64;
+        w.write_all(&num_entries.to_le_bytes())?;
+        w.write_all(&num_classes.to_le_bytes())?;
+        w.write_all(&num_slots.to_le_bytes())?;
+
+        // Choose narrowest width for class IDs
+        let width: u8 = if num_classes <= 256 { 1 } else if num_classes <= 65536 { 2 } else { 4 };
+        w.write_all(&[width])?;
+
+        // Bitset (raw u64 words)
+        let num_words = self.bitset.len() as u64;
+        w.write_all(&num_words.to_le_bytes())?;
+        let bitset_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.bitset.as_ptr() as *const u8,
+                self.bitset.len() * 8,
+            )
+        };
+        w.write_all(bitset_bytes)?;
+
+        // Dense class IDs at chosen width
+        match width {
+            1 => w.write_all(&self.dense_ids.iter().map(|&c| c as u8).collect::<Vec<_>>())?,
+            2 => {
+                for &c in &self.dense_ids {
+                    w.write_all(&(c as u16).to_le_bytes())?;
+                }
+            }
+            _ => {
+                let id_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.dense_ids.as_ptr() as *const u8,
+                        self.dense_ids.len() * 4,
+                    )
+                };
+                w.write_all(id_bytes)?;
+            }
+        }
+
+        // Blob
+        w.write_all(&(self.blob.len() as u64).to_le_bytes())?;
+        w.write_all(&self.blob)?;
+        w.flush().map_err(Into::into)
+    }
+
+    // ─── Load (v2 format) ───────────────────────────────────────────────────
+
+    pub fn load(path: &str) -> Result<Self> {
+        let mut f = BufReader::new(
+            File::open(path).context("Cannot open equivalence class accession file")?
+        );
+        let mut buf8 = [0u8; 8];
+        let mut buf1 = [0u8; 1];
+
+        // Header
+        f.read_exact(&mut buf8)?;
+        let num_entries = u64::from_le_bytes(buf8) as usize;
+        f.read_exact(&mut buf8)?;
+        let num_classes = u64::from_le_bytes(buf8) as usize;
+        f.read_exact(&mut buf8)?;
+        let num_slots = u64::from_le_bytes(buf8) as usize;
+        f.read_exact(&mut buf1)?;
+        let width = buf1[0];
+
+        // Bitset
+        f.read_exact(&mut buf8)?;
+        let num_words = u64::from_le_bytes(buf8) as usize;
+        let mut bitset = vec![0u64; num_words];
+        let bitset_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                bitset.as_mut_ptr() as *mut u8,
+                num_words * 8,
+            )
+        };
+        f.read_exact(bitset_bytes)?;
+
+        // Dense class IDs
+        let dense_ids: Vec<u32> = match width {
+            1 => {
+                let mut bytes = vec![0u8; num_entries];
+                f.read_exact(&mut bytes)?;
+                bytes.into_iter().map(|b| b as u32).collect()
+            }
+            2 => {
+                let mut bytes = vec![0u8; num_entries * 2];
+                f.read_exact(&mut bytes)?;
+                bytes.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
+                    .collect()
+            }
+            4 => {
+                let mut raw = vec![0u32; num_entries];
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        raw.as_mut_ptr() as *mut u8,
+                        num_entries * 4,
+                    )
+                };
+                f.read_exact(byte_slice)?;
+                raw
+            }
+            _ => anyhow::bail!("Invalid class_id width: {}", width),
+        };
+
+        // Blob
+        f.read_exact(&mut buf8)?;
+        let blob_len = u64::from_le_bytes(buf8) as usize;
+        eprintln!("  accession blob size: {} MB", blob_len / (1024 * 1024));
+        let mut blob = vec![0u8; blob_len];
+        f.read_exact(&mut blob)?;
+
+        // Rebuild offset table by walking blob
+        let mut offsets = Vec::with_capacity(num_classes);
+        let mut bpos: usize = 0;
+        for _ in 0..num_classes {
+            offsets.push(bpos as u32);
+            delta_vbyte_skip(&blob, &mut bpos);
+        }
+
+        // Build rank cache
+        let num_blocks = (bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
+        let mut rank_cache = Vec::with_capacity(num_blocks + 1);
+        let mut cumulative: u32 = 0;
+        for block in 0..num_blocks {
+            rank_cache.push(cumulative);
+            let start = block * RANK_BLOCK_WORDS;
+            let end = (start + RANK_BLOCK_WORDS).min(bitset.len());
+            for w in start..end {
+                cumulative += bitset[w].count_ones();
+            }
+        }
+        rank_cache.push(cumulative);
 
         Ok(Self {
-            name_to_id: HashMap::new(),
-            id_to_name,
+            bitset,
+            rank_cache,
+            dense_ids,
+            num_slots,
+            offsets,
+            blob,
+            num_classes,
         })
     }
 }
 
-/// CSR storage for variable-length accession lists per minimizer
-pub struct CsrAccessions {
-    /// Offset into `data` for each minimizer index. Length = num_minimizers + 1
-    offsets: Vec<u32>,
-    /// Concatenated accession IDs
-    data: Vec<u32>,
-}
-
-impl CsrAccessions {
-    /// Build from a map of MPHF index → list of accession IDs.
-    pub fn build(num_elements: usize, accessions_by_idx: &HashMap<u64, Vec<u32>>) -> Self {
-        let mut offsets = Vec::with_capacity(num_elements + 1);
-        let mut data = Vec::new();
-        let mut current_offset: u32 = 0;
-
-        for i in 0..num_elements {
-            offsets.push(current_offset);
-            if let Some(accs) = accessions_by_idx.get(&(i as u64)) {
-                for &acc in accs {
-                    data.push(acc);
-                }
-                current_offset += accs.len() as u32;
-            }
-        }
-        offsets.push(current_offset);
-
-        Self { offsets, data }
-    }
-
-    /// Get accession IDs for a given MPHF index.
-    pub fn get(&self, idx: usize) -> &[u32] {
-        if idx + 1 >= self.offsets.len() {
-            return &[];
-        }
-        let start = self.offsets[idx] as usize;
-        let end = self.offsets[idx + 1] as usize;
-        &self.data[start..end]
-    }
-
-    pub fn save(&self, path: &str) -> Result<()> {
-        let mut f = File::create(path)?;
-        let num_elements = (self.offsets.len() - 1) as u64;
-        f.write_all(&num_elements.to_le_bytes())?;
-        let data_len = self.data.len() as u64;
-        f.write_all(&data_len.to_le_bytes())?;
-
-        for &off in &self.offsets {
-            f.write_all(&off.to_le_bytes())?;
-        }
-        for &acc in &self.data {
-            f.write_all(&acc.to_le_bytes())?;
-        }
-        Ok(())
-    }
-
-    pub fn load(path: &str) -> Result<Self> {
-        let mut f = File::open(path).context("Cannot read CSR accession file")?;
-        let mut buf8 = [0u8; 8];
-
-        f.read_exact(&mut buf8)?;
-        let num_elements = u64::from_le_bytes(buf8) as usize;
-        f.read_exact(&mut buf8)?;
-        let data_len = u64::from_le_bytes(buf8) as usize;
-
-        let mut offsets = vec![0u32; num_elements + 1];
-        let offsets_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                offsets.as_mut_ptr() as *mut u8,
-                (num_elements + 1) * 4,
-            )
-        };
-        f.read_exact(offsets_bytes)?;
-
-        let mut data = vec![0u32; data_len];
-        let data_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                data.as_mut_ptr() as *mut u8,
-                data_len * 4,
-            )
-        };
-        f.read_exact(data_bytes)?;
-
-        Ok(Self { offsets, data })
-    }
-}
+// ─── KmerDatabase ────────────────────────────────────────────────────────────
 
 pub struct KmerDatabase {
     pub k: usize,
@@ -202,44 +508,37 @@ pub struct KmerDatabase {
     fingerprints: Vec<u16>,
     taxid_indices: Vec<u8>,
     index_to_taxid: Vec<u32>,
-    accessions: Option<CsrAccessions>,
+    accessions: Option<EqClassAccessions>,
 }
 
-/// Query hit result for a single minimizer.
-/// Borrows accession data directly from the database's CSR storage.
-pub struct Hit<'a> {
+pub struct Hit {
     pub taxid_idx: u8,
-    pub accessions: &'a [u32],
+    pub accession_class_id: Option<u32>,
     pub is_hit: bool,
 }
 
-/// Static empty slice used for hits with no accessions.
-const EMPTY_ACCESSIONS: &[u32] = &[];
-
 impl KmerDatabase {
     pub fn true_taxid(&self, idx: u8) -> u32 {
-        self.index_to_taxid
-            .get(idx as usize)
-            .copied()
-            .unwrap_or(0)
+        self.index_to_taxid.get(idx as usize).copied().unwrap_or(0)
     }
 
-    pub fn k(&self) -> usize {
-        self.k
+    pub fn k(&self) -> usize { self.k }
+    pub fn l(&self) -> usize { self.l }
+
+    /// Decode accession IDs from a class ID. Call only when you need the names.
+    pub fn resolve_accessions(&self, class_id: u32) -> Vec<u32> {
+        match self.accessions {
+            Some(ref acc) => acc.decode_class(class_id),
+            None => Vec::new(),
+        }
     }
 
-    pub fn l(&self) -> usize {
-        self.l
-    }
-
-    /// Query a read: extract minimizers and look up each one.
-    /// Results are appended to the provided `out` buffer (caller should clear it first).
-    pub fn query_into<'db>(
-        &'db self,
+    pub fn query_into(
+        &self,
         scanner: &crate::minimizer::MinimizerScanner,
         seq: &[u8],
         minimizer_buf: &mut Vec<u64>,
-        out: &mut Vec<Hit<'db>>,
+        out: &mut Vec<Hit>,
     ) {
         scanner.scan_into(seq, minimizer_buf);
         let has_acc = self.accessions.is_some();
@@ -249,90 +548,83 @@ impl KmerDatabase {
             let hit = match self.mphf.try_hash(&m) {
                 Some(idx_u64) => {
                     let idx = idx_u64 as usize;
-                    if idx < self.num_minimizers
-                        && self.fingerprints[idx] == compute_fingerprint(m)
-                    {
-                        let accessions = if has_acc {
-                            self.accessions.as_ref().unwrap().get(idx)
-                        } else {
-                            EMPTY_ACCESSIONS
-                        };
+                    if idx < self.num_minimizers && self.fingerprints[idx] == compute_fingerprint(m) {
                         Hit {
                             taxid_idx: self.taxid_indices[idx],
-                            accessions,
+                            accession_class_id: if has_acc {
+                                self.accessions.as_ref().unwrap().get_class_id(idx)
+                            } else {
+                                None
+                            },
                             is_hit: true,
                         }
                     } else {
-                        Hit {
-                            taxid_idx: 0,
-                            accessions: EMPTY_ACCESSIONS,
-                            is_hit: false,
-                        }
+                        Hit { taxid_idx: 0, accession_class_id: None, is_hit: false }
                     }
                 }
-                None => Hit {
-                    taxid_idx: 0,
-                    accessions: EMPTY_ACCESSIONS,
-                    is_hit: false,
-                },
+                None => Hit { taxid_idx: 0, accession_class_id: None, is_hit: false },
             };
             out.push(hit);
         }
     }
 
-    /// Save to disk
     pub fn save(&self, prefix: &str) -> Result<()> {
-        // Meta
+        // .meta
         {
-            let mut f = File::create(format!("{}.meta", prefix))?;
-            f.write_all(&(self.k as u32).to_le_bytes())?;
-            f.write_all(&(self.l as u32).to_le_bytes())?;
-            f.write_all(&self.spaced_seed_mask.to_le_bytes())?;
-            f.write_all(&self.toggle_mask.to_le_bytes())?;
-            f.write_all(&(self.num_minimizers as u64).to_le_bytes())?;
-            let has_acc: u8 = if self.accessions.is_some() { 1 } else { 0 };
-            f.write_all(&[has_acc])?;
+            let mut w = BufWriter::new(File::create(format!("{}.meta", prefix))?);
+            w.write_all(&(self.k as u32).to_le_bytes())?;
+            w.write_all(&(self.l as u32).to_le_bytes())?;
+            w.write_all(&self.spaced_seed_mask.to_le_bytes())?;
+            w.write_all(&self.toggle_mask.to_le_bytes())?;
+            w.write_all(&(self.num_minimizers as u64).to_le_bytes())?;
+            w.write_all(&[self.accessions.is_some() as u8])?;
+            w.flush()?;
         }
-
-        // MPHF
+        // .mphf
         {
             let encoded = bincode::serialize(&self.mphf)?;
             std::fs::write(format!("{}.mphf", prefix), &encoded)?;
         }
-
-        // Fingerprints
+        // .fp
         {
-            let mut f = File::create(format!("{}.fp", prefix))?;
-            for &fp in &self.fingerprints {
-                f.write_all(&fp.to_le_bytes())?;
-            }
+            let mut w = BufWriter::new(File::create(format!("{}.fp", prefix))?);
+            let fp_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.fingerprints.as_ptr() as *const u8,
+                    self.fingerprints.len() * 2,
+                )
+            };
+            w.write_all(fp_bytes)?;
+            w.flush()?;
         }
-
-        // TaxID indices
+        // .taxid  (u8 per minimizer)
         {
-            let mut f = File::create(format!("{}.taxid", prefix))?;
-            f.write_all(&self.taxid_indices)?;
+            let mut w = BufWriter::new(File::create(format!("{}.taxid", prefix))?);
+            w.write_all(&self.taxid_indices)?;
+            w.flush()?;
         }
-
-        // TaxID mapping
+        // .taxmap  (binary)
         {
-            let mut f = File::create(format!("{}.taxmap", prefix))?;
-            let sz = self.index_to_taxid.len() as u64;
-            f.write_all(&sz.to_le_bytes())?;
-            for &t in &self.index_to_taxid {
-                f.write_all(&t.to_le_bytes())?;
-            }
+            let mut w = BufWriter::new(File::create(format!("{}.taxmap", prefix))?);
+            w.write_all(&(self.index_to_taxid.len() as u64).to_le_bytes())?;
+            let taxmap_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.index_to_taxid.as_ptr() as *const u8,
+                    self.index_to_taxid.len() * 4,
+                )
+            };
+            w.write_all(taxmap_bytes)?;
+            w.flush()?;
         }
-
+        // .taxmap.txt  (human-readable)
         {
-            let mut f = File::create(format!("{}.taxmap.txt", prefix))?;
-            writeln!(f, "Index\tActual_TaxID")?;
+            let mut w = BufWriter::new(File::create(format!("{}.taxmap.txt", prefix))?);
+            writeln!(w, "Index\tActual_TaxID")?;
             for (i, &t) in self.index_to_taxid.iter().enumerate() {
-                writeln!(f, "{}\t{}", i, t)?;
+                writeln!(w, "{}\t{}", i, t)?;
             }
+            w.flush()?;
         }
-
-        // Optional accession CSR
         if let Some(ref acc) = self.accessions {
             acc.save(&format!("{}.accession", prefix))?;
         }
@@ -342,53 +634,44 @@ impl KmerDatabase {
     pub fn load(prefix: &str, load_accessions: bool) -> Result<Self> {
         eprintln!("Loading database from {}", prefix);
 
-        // Meta
+        // .meta
         let (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc) = {
             let mut f = File::open(format!("{}.meta", prefix))
                 .context("Cannot open .meta file")?;
             let mut buf4 = [0u8; 4];
             let mut buf8 = [0u8; 8];
-
-            f.read_exact(&mut buf4)?;
-            let k = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf4)?;
-            let l = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf8)?;
-            let spaced_seed_mask = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?;
-            let toggle_mask = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?;
-            let num_minimizers = u64::from_le_bytes(buf8) as usize;
             let mut buf1 = [0u8; 1];
-            f.read_exact(&mut buf1)?;
-            let has_acc = buf1[0] == 1;
 
+            f.read_exact(&mut buf4)?; let k  = u32::from_le_bytes(buf4) as usize;
+            f.read_exact(&mut buf4)?; let l  = u32::from_le_bytes(buf4) as usize;
+            f.read_exact(&mut buf8)?; let spaced_seed_mask = u64::from_le_bytes(buf8);
+            f.read_exact(&mut buf8)?; let toggle_mask      = u64::from_le_bytes(buf8);
+            f.read_exact(&mut buf8)?; let num_minimizers   = u64::from_le_bytes(buf8) as usize;
+            f.read_exact(&mut buf1)?; let has_acc          = buf1[0] == 1;
             (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc)
         };
 
-        // MPHF
-        let mphf: Mphf<u64> = {
-            let data = std::fs::read(format!("{}.mphf", prefix))
-                .context("Cannot read .mphf file")?;
-            bincode::deserialize(&data)?
+        // .mphf
+       let mphf: Mphf<u64> = {
+            let f = File::open(format!("{}.mphf", prefix))
+                .context("Cannot open .mphf file")?;
+            let reader = BufReader::new(f);
+            bincode::deserialize_from(reader)?
         };
 
-        // Fingerprints — read directly into Vec<u16>, no intermediate Vec<u8>
+        // .fp
         let fingerprints = {
             let mut f = File::open(format!("{}.fp", prefix))
                 .context("Cannot open .fp file")?;
             let mut fp = vec![0u16; num_minimizers];
             let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    fp.as_mut_ptr() as *mut u8,
-                    num_minimizers * 2,
-                )
+                std::slice::from_raw_parts_mut(fp.as_mut_ptr() as *mut u8, num_minimizers * 2)
             };
             f.read_exact(byte_slice)?;
             fp
         };
 
-        // TaxID indices
+        // .taxid
         let taxid_indices = {
             let mut f = File::open(format!("{}.taxid", prefix))
                 .context("Cannot open .taxid file")?;
@@ -397,7 +680,7 @@ impl KmerDatabase {
             v
         };
 
-        // TaxID mapping — read directly into Vec<u32>
+        // .taxmap
         let index_to_taxid = {
             let mut f = File::open(format!("{}.taxmap", prefix))
                 .context("Cannot open .taxmap file")?;
@@ -406,10 +689,7 @@ impl KmerDatabase {
             let sz = u64::from_le_bytes(buf8) as usize;
             let mut v = vec![0u32; sz];
             let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(
-                    v.as_mut_ptr() as *mut u8,
-                    sz * 4,
-                )
+                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, sz * 4)
             };
             f.read_exact(byte_slice)?;
             v
@@ -417,34 +697,17 @@ impl KmerDatabase {
 
         let acc_path = format!("{}.accession", prefix);
         let accessions = if load_accessions && has_acc && Path::new(&acc_path).exists() {
-            Some(CsrAccessions::load(&acc_path)?)
+            Some(EqClassAccessions::load(&acc_path)?)
         } else {
             None
         };
-
         Ok(Self {
-            k,
-            l,
-            spaced_seed_mask,
-            toggle_mask,
-            num_minimizers,
-            mphf,
-            fingerprints,
-            taxid_indices,
-            index_to_taxid,
-            accessions,
+            k, l, spaced_seed_mask, toggle_mask, num_minimizers,
+            mphf, fingerprints, taxid_indices, index_to_taxid, accessions,
         })
     }
 }
 
-/// Intermediate k-mer record extracted from Kraken output.
-pub struct ExtractedKmer {
-    pub sequence: String,
-    pub taxid: u32,
-    pub accession_id: Option<u32>,
-}
-
-/// Builds a KmerDatabase from extracted k-mers.
 pub struct KmerDatabaseBuilder {
     k: usize,
     l: usize,
@@ -461,120 +724,108 @@ impl KmerDatabaseBuilder {
         toggle_mask: u64,
         track_accessions: bool,
     ) -> Self {
-        Self {
-            k,
-            l,
-            spaced_seed_mask,
-            toggle_mask,
-            track_accessions,
-        }
+        Self { k, l, spaced_seed_mask, toggle_mask, track_accessions }
     }
 
-    pub fn build(&self, kmers: &[ExtractedKmer], _num_threads: usize) -> Result<KmerDatabase> {
-        use crate::minimizer::MinimizerScanner;
-        use std::collections::{BTreeSet, HashSet};
+    pub fn build_from_minimizers(
+        &self,
+        minimizer_maps: Vec<FxHashMap<u64, MinimizerEntry>>,
+    ) -> Result<KmerDatabase> {
+        use std::collections::BTreeSet;
 
         eprintln!("\nBuilding k-mer database");
-
         let start = std::time::Instant::now();
 
+        // Build taxid ↔ index mapping
         eprintln!("\nCreating TaxID mapping");
-        let unique_taxids: BTreeSet<u32> = kmers.iter().map(|k| k.taxid).collect();
+        let mut unique_taxids = BTreeSet::new();
+        let mut num_minimizers = 0;
+        for map in &minimizer_maps {
+            num_minimizers += map.len();
+            for entry in map.values() {
+                unique_taxids.insert(entry.taxid);
+            }
+        }
         eprintln!("  Found {} unique TaxIDs", unique_taxids.len());
 
         if unique_taxids.len() > 255 {
             anyhow::bail!(
-                "There are too many unique taxids ({}) for u8 storage (max 255)",
+                "Too many unique taxids ({}) for u8 storage (max 255)",
                 unique_taxids.len()
             );
         }
 
-        let mut index_to_taxid = Vec::new();
+        let mut index_to_taxid: Vec<u32> = Vec::new();
         let mut taxid_to_index: HashMap<u32, u8> = HashMap::new();
         for (i, &taxid) in unique_taxids.iter().enumerate() {
             index_to_taxid.push(taxid);
             taxid_to_index.insert(taxid, i as u8);
         }
 
-        eprintln!("\nExtracting minimizers");
-        let scanner = MinimizerScanner::new(
-            self.k,
-            self.l,
-            self.spaced_seed_mask,
-            self.toggle_mask,
-        );
-
-        struct MinimizerInfo {
-            taxid_idx: u8,
-            accessions: HashSet<u32>,
-        }
-
-        let mut minimizer_map: HashMap<u64, MinimizerInfo> = HashMap::new();
-
-        for kmer in kmers {
-            if let Some(m) = scanner.first_minimizer(kmer.sequence.as_bytes()) {
-                let taxid_idx = taxid_to_index[&kmer.taxid];
-                let entry = minimizer_map.entry(m).or_insert_with(|| MinimizerInfo {
-                    taxid_idx,
-                    accessions: HashSet::new(),
-                });
-                if let Some(acc_id) = kmer.accession_id {
-                    entry.accessions.insert(acc_id);
-                }
-            }
-        }
-
-        let num_minimizers = minimizer_map.len();
-        eprintln!("  Extracted {} unique minimizers", num_minimizers);
-
+        eprintln!("  {} unique minimizers", num_minimizers);
         if num_minimizers == 0 {
             anyhow::bail!("No minimizers found");
         }
 
-        eprintln!("\nBuilding MPHF");
-        let keys: Vec<u64> = minimizer_map.keys().copied().collect();
+        // Build MPHF
+        eprintln!("\nBuilding MPHF ({} keys)", num_minimizers);
+        let keys: Vec<u64> = minimizer_maps.iter().flat_map(|m| m.keys().copied()).collect();
         let mphf = Mphf::new(2.0, &keys);
+        drop(keys);
 
-        eprintln!("\nPopulating arrays");
+        // Populate lookup arrays
+        eprintln!("\nPopulating arrays (consuming maps to save memory)");
         let mut fingerprints = vec![0u16; num_minimizers];
         let mut taxid_indices = vec![0u8; num_minimizers];
-        let mut accessions_by_idx: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut accessions = self.track_accessions
+            .then(|| EqClassAccessions::new_empty(num_minimizers));
+        let mut hash_to_class: FxHashMap<u64, u32> = FxHashMap::default();
+        // Temporary build map: mphf_idx -> class_id (only during build, dropped before save)
+        let mut build_map: FxHashMap<u32, u32> = FxHashMap::default();
 
-        for (&kmer, info) in &minimizer_map {
-            let idx = mphf.hash(&kmer);
-            if (idx as usize) < num_minimizers {
-                fingerprints[idx as usize] = compute_fingerprint(kmer);
-                taxid_indices[idx as usize] = info.taxid_idx;
+        for map in minimizer_maps {
+            for (minimizer, entry) in map {
+                let idx = mphf.hash(&minimizer) as usize;
+                if idx < num_minimizers {
+                    fingerprints[idx] = compute_fingerprint(minimizer);
+                    taxid_indices[idx] = taxid_to_index[&entry.taxid];
 
-                if self.track_accessions && !info.accessions.is_empty() {
-                    let mut acc_list: Vec<u32> = info.accessions.iter().copied().collect();
-                    acc_list.sort_unstable();
-                    accessions_by_idx.insert(idx, acc_list);
+                    if let Some(ref mut acc) = accessions {
+                        if !entry.accessions_vbyte.is_empty() {
+                            let mut pos = 0;
+                            let decoded = delta_vbyte_decode(&entry.accessions_vbyte, &mut pos);
+                            acc.add_accessions(idx, &decoded, &mut hash_to_class, &mut build_map);
+                        }
+                    }
                 }
             }
         }
 
-        let accessions = if self.track_accessions {
-            Some(CsrAccessions::build(num_minimizers, &accessions_by_idx))
-        } else {
-            None
-        };
+        drop(hash_to_class);
 
-        let elapsed = start.elapsed();
-        eprintln!("\nDone!");
-        eprintln!("Took {:.2}s", elapsed.as_secs_f64());
+        if let Some(ref mut acc) = accessions {
+            eprintln!(
+                "  Equivalence classes: {} unique sets for accessions",
+                acc.num_classes - 1
+            );
+            acc.finalize_for_save(build_map);
+        } else {
+            drop(build_map);
+        }
+
+        eprintln!("\nDone building in {:.2}s", start.elapsed().as_secs_f64());
 
         Ok(KmerDatabase {
-            k: self.k,
-            l: self.l,
+            k: self.k, l: self.l,
             spaced_seed_mask: self.spaced_seed_mask,
             toggle_mask: self.toggle_mask,
-            num_minimizers,
-            mphf,
-            fingerprints,
-            taxid_indices,
-            index_to_taxid,
-            accessions,
+            num_minimizers, mphf, fingerprints, taxid_indices, index_to_taxid, accessions,
         })
     }
+}
+
+pub struct MinimizerEntry {
+    pub taxid: u32,
+    pub conflicted: bool,
+    pub accessions_vbyte: Box<[u8]>,
 }
