@@ -458,7 +458,6 @@ impl EqClassAccessions {
         // Blob
         f.read_exact(&mut buf8)?;
         let blob_len = u64::from_le_bytes(buf8) as usize;
-        eprintln!("  accession blob size: {} MB", blob_len / (1024 * 1024));
         let mut blob = vec![0u8; blob_len];
         f.read_exact(&mut blob)?;
 

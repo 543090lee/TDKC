@@ -38,6 +38,12 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
+        #[arg(short = 'w', long, default_value_t = 35)]
+        window_size: usize,
+
+        #[arg(short = 'm', long, default_value_t = 31)]
+        minimizer_size: usize,
+
         #[arg(short = 'a', long)]
         accession: bool,
 
@@ -59,8 +65,8 @@ enum Commands {
         #[arg(short = 'a', long)]
         accession: bool,
 
-        #[arg(short = 'c', long, default_value_t = 0.3)]
-        coverage: f64,
+        #[arg(short = 'c', long)]
+        coverage: Option<f64>,
 
         #[arg(short = 'o', long)]
         output_prefix: String,
@@ -79,6 +85,8 @@ fn main() -> anyhow::Result<()> {
             output,
             threads,
             accession,
+            window_size,
+            minimizer_size,
         } => {
             build::run_build(build::BuildConfig {
                 kraken_file: kraken,
@@ -88,6 +96,8 @@ fn main() -> anyhow::Result<()> {
                 db_prefix: output,
                 threads,
                 track_accessions: accession,
+                k: window_size,
+                l: minimizer_size
             })?;
         }
 

@@ -14,7 +14,7 @@ pub struct QueryConfig {
     pub read2_file: Option<String>,
     pub threads: usize,
     pub use_accessions: bool,
-    pub coverage_threshold: f64,
+    pub coverage_threshold: Option<f64>,
     pub output_prefix: String,
 }
 
@@ -47,7 +47,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let db_start = std::time::Instant::now();
 
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
-    let coverage_threshold = config.coverage_threshold;
 
     let acc_path = format!("{}.accessions", config.db_prefix);
     let acc_registry = if config.use_accessions {
@@ -146,8 +145,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             &db,
             &scanner,
             &acc_registry,
-            coverage_threshold,
+            &config.coverage_threshold,
             is_paired,
+            db.k,
+            db.l
         );
         let _ = writer_tx.send(result);
     });
@@ -211,8 +212,11 @@ fn classify_batch(
     db: &KmerDatabase,
     scanner: &MinimizerScanner,
     acc_registry: &Option<AccessionRegistry>,
-    coverage_threshold: f64,
+    coverage_threshold: &Option<f64>,
     is_paired: bool,
+    k: usize,
+    l: usize,
+
 ) -> BatchResult {
     let batch_len = batch.records1.len();
     let mut local_output: Vec<u8> = Vec::with_capacity(batch_len * 200);
@@ -270,8 +274,9 @@ fn classify_batch(
         }
 
         let coverage = valid_hits as f64 / total_window as f64;
-
-        if valid_hits == 0 || coverage < coverage_threshold {
+        // I should add another threshold of minimu hit group that looks at different number of minimizer hits
+        let threshold = coverage_threshold.unwrap_or((k as f64 - l as f64 + 1.0)*2.0 / (total_window as f64));
+        if valid_hits == 0 || coverage <= threshold {
             if is_paired {
                 let _ = write!(
                     local_output,

@@ -22,10 +22,10 @@ pub struct BuildConfig {
     pub db_prefix: String,
     pub threads: usize,
     pub track_accessions: bool,
+    pub k: usize,
+    pub l: usize
 }
 
-const K: usize = 35;
-const L: usize = 31;
 const SPACED_PATTERN: &str = "1111111111111111111110101010101";
 const TOGGLE_MASK: u64 = 0xe37e28c4271b5a2d;
 const NUM_SHARDS: usize = 64;
@@ -62,7 +62,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         None
     };
 
-    let scanner = MinimizerScanner::new(K, L, spaced_seed_mask, TOGGLE_MASK);
+    let scanner = MinimizerScanner::new(config.k, config.l, spaced_seed_mask, TOGGLE_MASK);
 
     let mut minimizer_shards = build_minimizer_shards_streaming(
         &config,
@@ -90,7 +90,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     );
 
     eprintln!("Building MPHF and saving...");
-    let db = KmerDatabaseBuilder::new(K, L, spaced_seed_mask, TOGGLE_MASK, config.track_accessions)
+    let db = KmerDatabaseBuilder::new(config.k, config.l, spaced_seed_mask, TOGGLE_MASK, config.track_accessions)
         .build_from_minimizers(minimizer_shards)?;
 
     db.save(&config.db_prefix)?;
