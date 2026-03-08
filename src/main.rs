@@ -59,14 +59,14 @@ enum Commands {
         #[arg(short = '2', long)]
         read2: Option<String>,
 
-        #[arg(short = 'j', long, default_value_t = 1)]
+        #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
         #[arg(short = 'a', long)]
         accession: bool,
 
-        #[arg(short = 'c', long)]
-        coverage: Option<f64>,
+        #[arg(short = 'm', long, default_value_t = 2)]
+        min_distinct_minimizers: usize,
 
         #[arg(short = 'o', long)]
         output_prefix: String,
@@ -107,7 +107,7 @@ fn main() -> anyhow::Result<()> {
             read2,
             threads,
             accession,
-            coverage,
+            min_distinct_minimizers,
             output_prefix,
         } => {
             query::run_query(query::QueryConfig {
@@ -116,8 +116,8 @@ fn main() -> anyhow::Result<()> {
                 read2_file: read2,
                 threads,
                 use_accessions: accession,
-                coverage_threshold: coverage, 
-                output_prefix: output_prefix
+                min_distinct_minimizers,
+                output_prefix: output_prefix,
             })?;
         }
     }

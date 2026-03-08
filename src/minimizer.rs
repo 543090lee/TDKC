@@ -1,15 +1,17 @@
 use crate::utils::RingDeque;
 const INVALID: u8 = 0xFF;
+const BASE_LUT: [u8; 256] = {
+    let mut lut = [INVALID; 256];
+    lut[b'A' as usize] = 0; lut[b'a' as usize] = 0;
+    lut[b'C' as usize] = 1; lut[b'c' as usize] = 1;
+    lut[b'G' as usize] = 2; lut[b'g' as usize] = 2;
+    lut[b'T' as usize] = 3; lut[b't' as usize] = 3;
+    lut
+};
 
 #[inline(always)]
 fn base_code(c: u8) -> u8 {
-    match c {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => INVALID,
-    }
+    BASE_LUT[c as usize]
 }
 
 pub struct MinimizerScanner {

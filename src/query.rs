@@ -14,7 +14,7 @@ pub struct QueryConfig {
     pub read2_file: Option<String>,
     pub threads: usize,
     pub use_accessions: bool,
-    pub coverage_threshold: Option<f64>,
+    pub min_distinct_minimizers: usize,
     pub output_prefix: String,
 }
 
@@ -145,10 +145,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             &db,
             &scanner,
             &acc_registry,
-            &config.coverage_threshold,
+            config.min_distinct_minimizers,
             is_paired,
-            db.k,
-            db.l
         );
         let _ = writer_tx.send(result);
     });
@@ -212,10 +210,8 @@ fn classify_batch(
     db: &KmerDatabase,
     scanner: &MinimizerScanner,
     acc_registry: &Option<AccessionRegistry>,
-    coverage_threshold: &Option<f64>,
-    is_paired: bool,
-    k: usize,
-    l: usize,
+    min_distinct_minimizers: usize,
+    is_paired: bool
 
 ) -> BatchResult {
     let batch_len = batch.records1.len();
@@ -228,6 +224,7 @@ fn classify_batch(
     let mut hits2: Vec<Hit> = Vec::new();
     let mut minimizer_buf1: Vec<u64> = Vec::new();
     let mut minimizer_buf2: Vec<u64> = Vec::new();
+    let mut distinct_buf: Vec<u64> = Vec::with_capacity(256);
 
     for i in 0..batch_len {
         let record = &batch.records1[i];
@@ -246,37 +243,38 @@ fn classify_batch(
             (0, false)
         };
 
-        let read1_window = if seq1.len() >= db.k() { seq1.len() - db.k() + 1 } else { 1 };
-        let read2_window = if has_r2 {
-            if seq2_len >= db.k() { seq2_len - db.k() + 1 } else { 1 }
-        } else {
-            0
-        };
-        let total_window = read1_window + read2_window;
-
         let mut valid_hits: usize = 0;
         let mut taxid_counts = [0u32; 256];
+        
+        distinct_buf.clear();
 
-        for hit in hits1.iter() {
+        for (idx, hit) in hits1.iter().enumerate() {
             if hit.is_hit {
                 valid_hits += 1;
                 taxid_counts[hit.taxid_idx as usize] += 1;
-            }
-        }
-
-        if has_r2 {
-            for hit in hits2.iter() {
-                if hit.is_hit {
-                    valid_hits += 1;
-                    taxid_counts[hit.taxid_idx as usize] += 1;
+                if idx < minimizer_buf1.len() {
+                    distinct_buf.push(minimizer_buf1[idx]);
                 }
             }
         }
 
-        let coverage = valid_hits as f64 / total_window as f64;
-        // I should add another threshold of minimu hit group that looks at different number of minimizer hits
-        let threshold = coverage_threshold.unwrap_or((k as f64 - l as f64 + 1.0)*2.0 / (total_window as f64));
-        if valid_hits == 0 || coverage <= threshold {
+        if has_r2 {
+            for (idx, hit) in hits2.iter().enumerate() {
+                if hit.is_hit {
+                    valid_hits += 1;
+                    taxid_counts[hit.taxid_idx as usize] += 1;
+                    if idx < minimizer_buf2.len() {
+                        distinct_buf.push(minimizer_buf2[idx]);
+                    }
+                }
+            }
+        }
+
+        distinct_buf.sort_unstable();
+        distinct_buf.dedup();
+        let distinct_minimizers = distinct_buf.len();
+
+        if valid_hits == 0 || distinct_minimizers < min_distinct_minimizers {
             if is_paired {
                 let _ = write!(
                     local_output,
@@ -328,7 +326,7 @@ fn classify_batch(
                 write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
             }
 
-            let _ = write!(local_output, "\tcov:{:.3}\n", coverage);
+            local_output.push(b'\n');
             *local_report.entry(best_taxid).or_default() += 1;
             local_classified += 1;
         }
@@ -485,7 +483,7 @@ fn open_fastx(path: &str) -> Result<FastxReader> {
     Ok(reader)
 }
 
-/// Read up to n records. Raw bytes — no to_uppercase(), no UTF-8 validation on sequence.
+/// Read up to n records. Raw bytes — no to_uppercase()
 fn read_records(reader: &mut FastxReader, n: usize) -> Result<Vec<FastqRecord>> {
     let mut records = Vec::with_capacity(n);
     for _ in 0..n {

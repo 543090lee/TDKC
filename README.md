@@ -28,3 +28,5 @@ Good idea
 maybe make read threshold (k-l+1)/(read length-k + 1)
 
 it seems like accession information like when it's 12059:7, right now our query.rs is outputting only the hit.accessions of the first 12059 hit from that long run...
+
+JUST SAY AMBIGUOUS! THE ONES THAT HAVE A TIE! Or actually just put them in unclassified
