@@ -507,6 +507,7 @@ pub struct KmerDatabase {
     fingerprints: Vec<u16>,
     taxid_indices: Vec<u8>,
     index_to_taxid: Vec<u32>,
+    pub ancestor_matrix: Vec<u8>,
     accessions: Option<EqClassAccessions>,
 }
 
@@ -523,6 +524,15 @@ impl KmerDatabase {
 
     pub fn k(&self) -> usize { self.k }
     pub fn l(&self) -> usize { self.l }
+
+    #[inline(always)]
+    pub fn is_ancestor(&self, ancestor_idx: u8, descendant_idx: u8) -> bool {
+        let n = self.index_to_taxid.len();
+        let a = ancestor_idx as usize;
+        let d = descendant_idx as usize;
+        if a >= n || d >= n { return false; }
+        self.ancestor_matrix[a * n + d] != 0
+    }
 
     /// Decode accession IDs from a class ID. Call only when you need the names.
     pub fn resolve_accessions(&self, class_id: u32) -> Vec<u32> {
@@ -613,6 +623,7 @@ impl KmerDatabase {
                 )
             };
             w.write_all(taxmap_bytes)?;
+            w.write_all(&self.ancestor_matrix)?;
             w.flush()?;
         }
         // .taxmap.txt  (human-readable)
@@ -680,7 +691,7 @@ impl KmerDatabase {
         };
 
         // .taxmap
-        let index_to_taxid = {
+        let (index_to_taxid, ancestor_matrix) = {
             let mut f = File::open(format!("{}.taxmap", prefix))
                 .context("Cannot open .taxmap file")?;
             let mut buf8 = [0u8; 8];
@@ -691,7 +702,13 @@ impl KmerDatabase {
                 std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, sz * 4)
             };
             f.read_exact(byte_slice)?;
-            v
+            
+            let mut anc = vec![0u8; sz * sz];
+            if let Err(_) = f.read_exact(&mut anc) {
+                eprintln!("  Note: No ancestor matrix found in DB (old format). Ties will not roll up.");
+                anc.fill(0);
+            }
+            (v, anc)
         };
 
         let acc_path = format!("{}.accession", prefix);
@@ -702,7 +719,7 @@ impl KmerDatabase {
         };
         Ok(Self {
             k, l, spaced_seed_mask, toggle_mask, num_minimizers,
-            mphf, fingerprints, taxid_indices, index_to_taxid, accessions,
+            mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions,
         })
     }
 }
@@ -729,6 +746,7 @@ impl KmerDatabaseBuilder {
     pub fn build_from_minimizers(
         &self,
         minimizer_maps: Vec<FxHashMap<u64, MinimizerEntry>>,
+        taxonomy: &crate::taxonomy::TaxonomyTree,
     ) -> Result<KmerDatabase> {
         use std::collections::BTreeSet;
 
@@ -764,6 +782,26 @@ impl KmerDatabaseBuilder {
         eprintln!("  {} unique minimizers", num_minimizers);
         if num_minimizers == 0 {
             anyhow::bail!("No minimizers found");
+        }
+
+        eprintln!("\nGenerating Ancestry Matrix...");
+        let n = index_to_taxid.len();
+        let mut ancestor_matrix = vec![0u8; n * n];
+        
+        for i in 0..n {
+            for j in 0..n {
+                let parent_taxid = index_to_taxid[i];
+                let child_taxid = index_to_taxid[j];
+                
+                if parent_taxid == child_taxid {
+                    ancestor_matrix[i * n + j] = 1;
+                } else {
+                    let path = taxonomy.lineage_path(child_taxid);
+                    if path.contains(&parent_taxid) {
+                        ancestor_matrix[i * n + j] = 1;
+                    }
+                }
+            }
         }
 
         // Build MPHF
@@ -818,7 +856,7 @@ impl KmerDatabaseBuilder {
             k: self.k, l: self.l,
             spaced_seed_mask: self.spaced_seed_mask,
             toggle_mask: self.toggle_mask,
-            num_minimizers, mphf, fingerprints, taxid_indices, index_to_taxid, accessions,
+            num_minimizers, mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions,
         })
     }
 }

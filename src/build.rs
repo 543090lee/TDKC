@@ -91,7 +91,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
 
     eprintln!("Building MPHF and saving...");
     let db = KmerDatabaseBuilder::new(config.k, config.l, spaced_seed_mask, TOGGLE_MASK, config.track_accessions)
-        .build_from_minimizers(minimizer_shards)?;
+        .build_from_minimizers(minimizer_shards,&taxonomy)?;
 
     db.save(&config.db_prefix)?;
 

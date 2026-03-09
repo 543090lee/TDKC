@@ -35,6 +35,7 @@ struct BatchResult {
     report_counts: FxHashMap<u32, usize>,
     classified: usize,
     unclassified: usize,
+    ambiguous: usize,
     num_records: usize,
 }
 
@@ -45,7 +46,6 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         .ok();
 
     let db_start = std::time::Instant::now();
-
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
 
     let acc_path = format!("{}.accessions", config.db_prefix);
@@ -69,28 +69,22 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     );
 
     let db_elapsed = db_start.elapsed();
-
     let is_paired = config.read2_file.is_some();
 
-    if is_paired {
-        eprintln!("Running paired-end reads");
-    } else {
-        eprintln!("Running single-end reads");
-    }
+    if is_paired { eprintln!("Running paired-end reads"); } 
+    else { eprintln!("Running single-end reads"); }
 
     let classify_start = std::time::Instant::now();
-
+    
     // thread only to write, no lock, so less overhead
     let output_file = File::create(format!("{}.output", config.output_prefix))?;
 
     // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
     // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
-
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
 
     // literally writer thread will act as a mutex, but without contention
-    let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize)> {
-
+    let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
         //now we dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
         //when it;s full
         let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
@@ -99,6 +93,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         // I could use AtomicUsize for these, since these are single values, but too lazy
         let mut total_c: usize = 0;
         let mut total_u: usize = 0;
+        let mut total_a: usize = 0;
         let mut total_n: usize = 0;
 
         for batch in writer_rx {
@@ -108,19 +103,18 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             }
             total_c += batch.classified;
             total_u += batch.unclassified;
+            total_a += batch.ambiguous;
             total_n += batch.num_records;
         }
         writer.flush()?;
-        Ok((global_report, total_c, total_u, total_n))
+        Ok((global_report, total_c, total_u, total_a, total_n))
     });
 
-
     let batch_size = 5_000;
-
+    
     // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
     // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
     // to wait before starting on the nextc chunk (mpsc)
-
     let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
 
     // Reader thread(s): produce batches directly (no intermediate chunks)
@@ -152,7 +146,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     });
 
     drop(writer_tx);
-    let (global_report, c, u, num_records) = match writer_handle.join() {
+    let (global_report, c, u, a, num_records) = match writer_handle.join() {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(e),
         Err(_) => anyhow::bail!("Writer thread panicked"),
@@ -177,33 +171,31 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
         for (taxid, count) in &sorted {
             let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
-            writeln!(writer, "{}\t{}\t{:0.3}", taxid, count, ratio)?;
+            let taxid_label = if *taxid == u32::MAX { "Ambiguous".to_string() } else { taxid.to_string() };
+            writeln!(writer, "{}\t{}\t{:0.3}", taxid_label, count, ratio)?;
         }
         writer.flush()?;
     }
 
-    if c + u != num_records {
-        eprintln!("Warning C+U is not adding up to number of reads");
+    if c + u + a != num_records {
+        eprintln!("Warning C+U+A is not adding up to number of reads");
     }
 
     eprintln!("Classified:   {}", c);
+    eprintln!("Ambiguous:    {}", a);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", num_records);
     eprintln!("DB load:      {:.2}s", db_elapsed.as_secs_f64());
     eprintln!("Classify:     {:.2}s", classify_elapsed.as_secs_f64());
     eprintln!("Total time:   {:.2}s", db_elapsed.as_secs_f64() + classify_elapsed.as_secs_f64());
     if classify_elapsed.as_secs_f64() > 0.0 {
-        eprintln!(
-            "Throughput:   {:.0} reads/s",
-            num_records as f64 / classify_elapsed.as_secs_f64()
-        );
+        eprintln!("Throughput:   {:.0} reads/s", num_records as f64 / classify_elapsed.as_secs_f64());
     }
     Ok(())
 }
 
 // Tried not to use mutex here since it was keep giving me extra lock contention overhead
 // This was the main reason I switched to having a main writer thread
-
 #[inline(never)]
 fn classify_batch(
     batch: &ReadBatch,
@@ -212,13 +204,13 @@ fn classify_batch(
     acc_registry: &Option<AccessionRegistry>,
     min_distinct_minimizers: usize,
     is_paired: bool
-
 ) -> BatchResult {
     let batch_len = batch.records1.len();
     let mut local_output: Vec<u8> = Vec::with_capacity(batch_len * 200);
     let mut local_report: FxHashMap<u32, usize> = FxHashMap::default();
     let mut local_classified: usize = 0;
     let mut local_unclassified: usize = 0;
+    let mut local_ambiguous: usize = 0;
 
     let mut hits1: Vec<Hit> = Vec::new();
     let mut hits2: Vec<Hit> = Vec::new();
@@ -292,43 +284,108 @@ fn classify_batch(
             }
             local_unclassified += 1;
         } else {
-            let mut best_taxid_idx: u8 = 0;
+            let mut best_taxids: Vec<u8> = Vec::new();
             let mut best_count: u32 = 0;
+            
             for (idx, &count) in taxid_counts.iter().enumerate() {
+                if count == 0 { continue; }
                 if count > best_count {
                     best_count = count;
-                    best_taxid_idx = idx as u8;
+                    best_taxids.clear();
+                    best_taxids.push(idx as u8);
+                } else if count == best_count {
+                    best_taxids.push(idx as u8);
                 }
             }
 
-            let best_taxid = db.true_taxid(best_taxid_idx);
+            // --- ROLLUP LOGIC ---
+            let mut resolved_taxid_idx: Option<u8> = None;
+            
+            if best_taxids.len() > 1 {
+                for &candidate_idx in &best_taxids {
+                    let mut is_ancestor_of_all = true;
+                    for &other_idx in &best_taxids {
+                        if candidate_idx != other_idx {
+                            if !db.is_ancestor(candidate_idx, other_idx) {
+                                is_ancestor_of_all = false;
+                                break;
+                            }
+                        }
+                    }
+                    if is_ancestor_of_all {
+                        resolved_taxid_idx = Some(candidate_idx);
+                        break;
+                    }
+                }
+            } else if best_taxids.len() == 1 {
+                resolved_taxid_idx = Some(best_taxids[0]);
+            }
 
-            if is_paired {
-                let _ = write!(
-                    local_output,
-                    "C\t{}\t{}\t{}|{}\t",
-                    unsafe { std::str::from_utf8_unchecked(&record.header) },
-                    best_taxid, seq1.len(), seq2_len
-                );
+            if let Some(final_idx) = resolved_taxid_idx {
+                // Classified (C) - Handled cleanly or resolved via ancestry
+                let best_taxid = db.true_taxid(final_idx);
+
+                if is_paired {
+                    let _ = write!(
+                        local_output,
+                        "C\t{}\t{}\t{}|{}\t",
+                        unsafe { std::str::from_utf8_unchecked(&record.header) },
+                        best_taxid, seq1.len(), seq2_len
+                    );
+                } else {
+                    let _ = write!(
+                        local_output,
+                        "C\t{}\t{}\t{}\t",
+                        unsafe { std::str::from_utf8_unchecked(&record.header) },
+                        best_taxid, seq1.len()
+                    );
+                }
+
+                write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+
+                if has_r2 {
+                    local_output.extend_from_slice(b" |:| ");
+                    write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                }
+
+                local_output.push(b'\n');
+                *local_report.entry(best_taxid).or_default() += 1;
+                local_classified += 1;
+
             } else {
-                let _ = write!(
-                    local_output,
-                    "C\t{}\t{}\t{}\t",
-                    unsafe { std::str::from_utf8_unchecked(&record.header) },
-                    best_taxid, seq1.len()
-                );
+                // Ambiguous Tie (A) - Could not be rolled up
+                let tied_taxids_str = best_taxids
+                    .iter()
+                    .map(|&idx| db.true_taxid(idx).to_string())
+                    .join(",");
+
+                if is_paired {
+                    let _ = write!(
+                        local_output,
+                        "A\t{}\t{}\t{}|{}\t",
+                        unsafe { std::str::from_utf8_unchecked(&record.header) },
+                        tied_taxids_str, seq1.len(), seq2_len
+                    );
+                } else {
+                    let _ = write!(
+                        local_output,
+                        "A\t{}\t{}\t{}\t",
+                        unsafe { std::str::from_utf8_unchecked(&record.header) },
+                        tied_taxids_str, seq1.len()
+                    );
+                }
+
+                write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+
+                if has_r2 {
+                    local_output.extend_from_slice(b" |:| ");
+                    write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                }
+
+                local_output.push(b'\n');
+                *local_report.entry(u32::MAX).or_default() += 1; 
+                local_ambiguous += 1;
             }
-
-            write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-
-            if has_r2 {
-                local_output.extend_from_slice(b" |:| ");
-                write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
-            }
-
-            local_output.push(b'\n');
-            *local_report.entry(best_taxid).or_default() += 1;
-            local_classified += 1;
         }
     }
 
@@ -337,6 +394,7 @@ fn classify_batch(
         report_counts: local_report,
         classified: local_classified,
         unclassified: local_unclassified,
+        ambiguous: local_ambiguous,
         num_records: batch_len,
     }
 }
@@ -348,22 +406,14 @@ fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_reg
         return;
     }
 
-    let mut current_taxid = if hits[0].is_hit {
-        db.true_taxid(hits[0].taxid_idx)
-    } else {
-        0
-    };
+    let mut current_taxid = if hits[0].is_hit { db.true_taxid(hits[0].taxid_idx) } else { 0 };
     let mut run_len: u32 = 1;
 
     let mut current_class_id = hits[0].accession_class_id;
     let reg = acc_registry.as_ref();
 
     for hit in hits.iter().skip(1) {
-        let t = if hit.is_hit {
-            db.true_taxid(hit.taxid_idx)
-        } else {
-            0
-        };
+        let t = if hit.is_hit { db.true_taxid(hit.taxid_idx) } else { 0 };
         if t == current_taxid {
             run_len += 1;
         } else {
@@ -401,30 +451,17 @@ fn emit_run(
     let _ = write!(out, "{}:{} ", taxid, run_len);
 }
 
-fn read_single_batches(
-    r1_path: &str,
-    batch_size: usize,
-    tx: &crossbeam_channel::Sender<ReadBatch>,
-) -> Result<()> {
+fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>) -> Result<()> {
     let mut r1_reader = open_fastx(r1_path)?;
     loop {
         let recs1 = read_records(&mut r1_reader, batch_size)?;
-        if recs1.is_empty() {
-            break;
-        }
-        if tx.send(ReadBatch { records1: recs1, records2: None }).is_err() {
-            break;
-        }
+        if recs1.is_empty() { break; }
+        if tx.send(ReadBatch { records1: recs1, records2: None }).is_err() { break; }
     }
     Ok(())
 }
 
-fn read_paired_batches(
-    r1_path: &str,
-    r2_path: &str,
-    batch_size: usize,
-    tx: &crossbeam_channel::Sender<ReadBatch>,
-) -> Result<()> {
+fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>) -> Result<()> {
     // R2 decompresses in its own thread, sends batches to us
     let (r2_tx, r2_rx) = crossbeam_channel::bounded::<Option<Vec<FastqRecord>>>(4);
     let r2_path_owned = r2_path.to_string();
@@ -438,9 +475,7 @@ fn read_paired_batches(
                 let _ = r2_tx.send(None);
                 break;
             }
-            if r2_tx.send(Some(recs2)).is_err() {
-                break;
-            }
+            if r2_tx.send(Some(recs2)).is_err() { break; }
         }
         Ok(())
     });
@@ -448,23 +483,16 @@ fn read_paired_batches(
     let mut r1_reader = open_fastx(r1_path)?;
     loop {
         let recs1 = read_records(&mut r1_reader, batch_size)?;
-        if recs1.is_empty() {
-            break;
-        }
+        if recs1.is_empty() { break; }
         let recs2 = match r2_rx.recv() {
             Ok(Some(r2)) => r2,
             Ok(None) => anyhow::bail!("R2 file ended before R1"),
             Err(_) => anyhow::bail!("R2 reader thread disconnected"),
         };
         if recs2.len() != recs1.len() {
-            anyhow::bail!(
-                "There is a read count mismatch: R1={}, R2={}",
-                recs1.len(), recs2.len()
-            );
+            anyhow::bail!("There is a read count mismatch: R1={}, R2={}", recs1.len(), recs2.len());
         }
-        if tx.send(ReadBatch { records1: recs1, records2: Some(recs2) }).is_err() {
-            break;
-        }
+        if tx.send(ReadBatch { records1: recs1, records2: Some(recs2) }).is_err() { break; }
     }
 
     match r2_handle.join() {
@@ -497,7 +525,7 @@ fn read_records(reader: &mut FastxReader, n: usize) -> Result<Vec<FastqRecord>> 
                     });
                 }
             }
-            Some(Err(e)) => return Err(anyhow::anyhow!("Not sure what the error is but can't read records {}", e)),
+            Some(Err(e)) => return Err(anyhow::anyhow!("Error reading records: {}", e)),
             None => break,
         }
     }
