@@ -1,4 +1,4 @@
-# Discrete-Distilled-Model
+# TDKC - Target Distilled K-mer Classifier
 
 writing in rust
 
