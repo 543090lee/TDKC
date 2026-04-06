@@ -1,32 +1,159 @@
-# TDKC - Target Distilled K-mer Classifier
+<div align="center">
 
-writing in rust
+<img src="./tdkc_logo.png" width="220" alt="TDKC Logo"/>
 
-TODO: 
+# TDKC
 
-add an option/parameter where if you do --consensus/no-fp then when we build, we look at accession information, and based on how well it's distributed or hitting many same targets, we include it or not.
-Good idea
+### Target Distilled K-mer Classifier: Ultrafast and Memory-Efficient Metagenomic Sequence Classification for Target Pathogen Diagnostics
 
+[![Build](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/543090lee/TDKC)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://github.com/543090lee/TDKC)
 
-~~make load and writing bulk, minimize write_all : loead is now fixed, maybe faster write~~
+[Paper](https://github.com/543090lee/TDKC) · [Getting Started](#quick-start) · [Citation](#citation)
 
-~~i might be using 2x memory when loading Accession registry since it's making id_to_name and name_to_id. but i dont need name_to_id during query time.~~
+</div>
 
-~~paired end read feature: just concatenate and make it coverage for that one long string~~
+---
 
-~~it probably has to be streamlined i think, for writing output file. kinda inefficient i think~~
+## Installation
 
-~~SIMD vectorization~~
+**Prerequisites:** [Rust ≥ 1.70](https://rustup.rs/), [`seqtk`](https://github.com/lh3/seqtk), [`ripgrep`](https://github.com/BurntSushi/ripgrep)
 
-~~stream FASTQ not load all at once~~
+```bash
+git clone https://github.com/543090lee/TDKC.git
+cd TDKC
+cargo build --release
+```
 
-~~reasoning on why to use 30% coverage, maybe compare it to kraken2 how they look at actual minimizer sampling~~
+The binary will be at `./target/release/tdkc`.
 
+---
 
-~~bro i dont know what to do when a minimizer gets two different taxid when extracting from kraken2 output~~
+## Quick Start
 
-maybe make read threshold (k-l+1)/(read length-k + 1)
+TDKC has three main steps: `prep` → `build` → `query`.
 
-it seems like accession information like when it's 12059:7, right now our query.rs is outputting only the hit.accessions of the first 12059 hit from that long run...
+### 1. Prep
 
-JUST SAY AMBIGUOUS! THE ONES THAT HAVE A TIE! Or actually just put them in unclassified
+Extract target sequences and build an accession→taxid map.
+
+```bash
+tdkc prep \
+  -f /data/refseq.fna.gz \
+  -x /data/nucl_gb.accession2taxid \
+  -t targets.txt \
+  -n nodes.dmp \
+  -o prep_output/
+```
+
+Outputs: `prep_output/prelim_map.txt`, `prep_output/target.fasta`
+
+---
+
+### 2. Build
+
+Distill the target k-mer index.
+
+```bash
+tdkc build \
+  -f /data/refseq.fna.gz \
+  --target-fasta prep_output/target.fasta \
+  --prelim-map   prep_output/prelim_map.txt \
+  -t targets.txt \
+  -n nodes.dmp \
+  -o my_db \
+  -j 32
+```
+
+Add `-a` to enable per-minimizer accession tracking (TDKC-A mode).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-j` | all cores | Threads |
+| `-w` | `35` | Window size k |
+| `-m` | `31` | Minimizer length l |
+| `-a` | off | Enable accession tracking |
+
+---
+
+### 3. Query
+
+```bash
+tdkc query \
+  -d my_db \
+  -1 sample_R1.fastq.gz \
+  -2 sample_R2.fastq.gz \
+  -j 32 \
+  -o results/sample
+```
+
+Outputs: `results/sample.tsv` (per-read) and `results/sample.report` (summary).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-g` | `2` | Min distinct minimizer hit groups |
+| `-a` | off | Output per-read accession hits (requires TDKC-A db) |
+| `-b` | off | Enable domain Bloom filter background labels |
+
+---
+
+### (Optional) Build Domain Bloom Filters
+
+```bash
+tdkc build-domain \
+  -d my_db \
+  --bacteria /data/bacteria.fna \
+  --viral    /data/viral.fna \
+  -j 32
+```
+
+Activate at query time with `-b` to label non-target reads by broad domain.
+
+---
+
+## Input Files
+
+| File | Description |
+|------|-------------|
+| `refseq.fna.gz` | Full reference FASTA (NCBI RefSeq + Viral NT) |
+| `targets.txt` | One NCBI taxid per line (any rank — genus, species, etc.) |
+| `nodes.dmp` | NCBI taxonomy `nodes.dmp` |
+| `nucl_gb.accession2taxid` | NCBI accession→taxid mapping |
+
+**RefSeq:** https://ftp.ncbi.nlm.nih.gov/genomes/refseq/  
+**Viral NT:** https://ftp.ncbi.nlm.nih.gov/genomes/Viruses/AllNucleotide/  
+**Taxonomy:** https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/
+
+---
+
+## Output Format
+
+**Per-read (`.tsv`)**
+```
+read1   147711   147711-{NC_038311.1,PX761384.1,...}:17
+```
+Fields: read name · assigned taxid · hit detail string (accessions + counts when `-a` enabled)
+
+**Report (`.report`):** Kraken2-compatible summary with read counts per taxon.
+
+---
+
+## Citation
+
+```bibtex
+@article{lee2025tdkc,
+  title   = {TDKC: Memory-Efficient and Fast Sequence Classification
+             for Target Pathogen Diagnostics},
+  author  = {Lee, Seungmo and Eskin, Eleazar},
+  year    = {2025},
+  url     = {https://github.com/543090lee/TDKC}
+}
+```
+
+---
+
+## License
+
+MIT © Seungmo Lee & Eleazar Eskin · UCLA Department of Computer Science

@@ -8,7 +8,7 @@ use boomphf::Mphf;
 use rustc_hash::FxHashMap;
 
 #[inline]
-fn compute_fingerprint(mut kmer: u64) -> u16 {
+pub fn compute_fingerprint(mut kmer: u64) -> u16 {
     kmer ^= kmer >> 33;
     kmer = kmer.wrapping_mul(0xff51afd7ed558ccd);
     kmer ^= kmer >> 33;
@@ -506,18 +506,35 @@ pub struct KmerDatabase {
     mphf: Mphf<u64>,
     fingerprints: Vec<u16>,
     taxid_indices: Vec<u8>,
-    index_to_taxid: Vec<u32>,
+    pub index_to_taxid: Vec<u32>,
     pub ancestor_matrix: Vec<u8>,
     accessions: Option<EqClassAccessions>,
 }
 
-pub struct Hit {
-    pub taxid_idx: u8,
-    pub accession_class_id: Option<u32>,
-    pub is_hit: bool,
-}
 
 impl KmerDatabase {
+    /// Direct constructor — used by build.rs to create the DB without
+    /// going through an intermediate MinimizerEntry representation.
+    pub fn new(
+        k: usize,
+        l: usize,
+        spaced_seed_mask: u64,
+        toggle_mask: u64,
+        num_minimizers: usize,
+        mphf: Mphf<u64>,
+        fingerprints: Vec<u16>,
+        taxid_indices: Vec<u8>,
+        index_to_taxid: Vec<u32>,
+        ancestor_matrix: Vec<u8>,
+        accessions: Option<EqClassAccessions>,
+    ) -> Self {
+        Self {
+            k, l, spaced_seed_mask, toggle_mask,
+            num_minimizers, mphf, fingerprints, taxid_indices,
+            index_to_taxid, ancestor_matrix, accessions,
+        }
+    }
+
     pub fn true_taxid(&self, idx: u8) -> u32 {
         self.index_to_taxid.get(idx as usize).copied().unwrap_or(0)
     }
@@ -548,32 +565,74 @@ impl KmerDatabase {
         seq: &[u8],
         minimizer_buf: &mut Vec<u64>,
         out: &mut Vec<Hit>,
+        bg_filters: &[(DomainBloomFilter, u32)],
     ) {
         scanner.scan_into(seq, minimizer_buf);
         let has_acc = self.accessions.is_some();
 
         out.reserve(minimizer_buf.len());
         for &m in minimizer_buf.iter() {
-            let hit = match self.mphf.try_hash(&m) {
-                Some(idx_u64) => {
-                    let idx = idx_u64 as usize;
-                    if idx < self.num_minimizers && self.fingerprints[idx] == compute_fingerprint(m) {
-                        Hit {
-                            taxid_idx: self.taxid_indices[idx],
-                            accession_class_id: if has_acc {
-                                self.accessions.as_ref().unwrap().get_class_id(idx)
-                            } else {
-                                None
-                            },
-                            is_hit: true,
-                        }
+            if m == u64::MAX {
+                out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid: 0 });
+                continue;
+            }
+
+            let mut is_hit = false;
+            let mut hit_idx = 0;
+
+            if let Some(idx_u64) = self.mphf.try_hash(&m) {
+                let idx = idx_u64 as usize;
+                if idx < self.num_minimizers && self.fingerprints[idx] == compute_fingerprint(m) {
+                    is_hit = true;
+                    hit_idx = idx;
+                }
+            }
+
+            if is_hit {
+                out.push(Hit {
+                    taxid_idx: self.taxid_indices[hit_idx],
+                    accession_class_id: if has_acc {
+                        self.accessions.as_ref().unwrap().get_class_id(hit_idx)
                     } else {
-                        Hit { taxid_idx: 0, accession_class_id: None, is_hit: false }
+                        None
+                    },
+                    is_hit: true,
+                    bg_taxid: 0,
+                });
+            } else {
+                // --- NEW BACKGROUND LCA LOGIC ---
+                let mut match_count = 0;
+                let mut last_hit_taxid = 0;
+                let mut hit_viral = false;
+                let mut hit_cellular = false;
+
+                for (filter, t_id) in bg_filters {
+                    if filter.contains(m) {
+                        match_count += 1;
+                        last_hit_taxid = *t_id;
+                        
+                        if *t_id == 10239 { // Viruses
+                            hit_viral = true;
+                        } else { // Bacteria (2), Archaea (2157), Fungi (4751)
+                            hit_cellular = true;
+                        }
                     }
                 }
-                None => Hit { taxid_idx: 0, accession_class_id: None, is_hit: false },
-            };
-            out.push(hit);
+
+                let bg_taxid = match match_count {
+                    0 => 0,
+                    1 => last_hit_taxid, // Exact match to a single domain
+                    _ => {
+                        if hit_viral && hit_cellular {
+                            1 // Root: LCA of Viruses + Cellular
+                        } else {
+                            131567 // Cellular organisms: LCA of Bacteria, Archaea, Fungi
+                        }
+                    }
+                };
+
+                out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid });
+            }
         }
     }
 
@@ -724,145 +783,73 @@ impl KmerDatabase {
     }
 }
 
-pub struct KmerDatabaseBuilder {
-    k: usize,
-    l: usize,
-    spaced_seed_mask: u64,
-    toggle_mask: u64,
-    track_accessions: bool,
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct DomainBloomFilter {
+    pub data: Vec<u8>,
+    pub num_hashes: u32,
+    pub num_bits: u64,
 }
 
-impl KmerDatabaseBuilder {
-    pub fn new(
-        k: usize,
-        l: usize,
-        spaced_seed_mask: u64,
-        toggle_mask: u64,
-        track_accessions: bool,
-    ) -> Self {
-        Self { k, l, spaced_seed_mask, toggle_mask, track_accessions }
+impl DomainBloomFilter {
+    pub fn new(data: Vec<u8>, num_hashes: u32, num_bits: u64) -> Self {
+        Self { data, num_hashes, num_bits }
     }
 
-    pub fn build_from_minimizers(
-        &self,
-        minimizer_maps: Vec<FxHashMap<u64, MinimizerEntry>>,
-        taxonomy: &crate::taxonomy::TaxonomyTree,
-    ) -> Result<KmerDatabase> {
-        use std::collections::BTreeSet;
-
-        eprintln!("\nBuilding k-mer database");
-        let start = std::time::Instant::now();
-
-        // Build taxid ↔ index mapping
-        eprintln!("\nCreating TaxID mapping");
-        let mut unique_taxids = BTreeSet::new();
-        let mut num_minimizers = 0;
-        for map in &minimizer_maps {
-            num_minimizers += map.len();
-            for entry in map.values() {
-                unique_taxids.insert(entry.taxid);
+    #[inline]
+    pub fn contains(&self, item: u64) -> bool {
+        let (h1, h2) = Self::hash_pair(item);
+        for i in 0..self.num_hashes {
+            let bit_pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.num_bits;
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_mask = 1u8 << (bit_pos % 8);
+            if self.data[byte_idx] & bit_mask == 0 {
+                return false;
             }
         }
-        eprintln!("  Found {} unique TaxIDs", unique_taxids.len());
+        true
+    }
 
-        if unique_taxids.len() > 255 {
-            anyhow::bail!(
-                "Too many unique taxids ({}) for u8 storage (max 255)",
-                unique_taxids.len()
-            );
-        }
+    #[inline(always)]
+    fn hash_pair(item: u64) -> (u64, u64) {
+        let mut h1 = item;
+        h1 ^= h1 >> 33;
+        h1 = h1.wrapping_mul(0xff51afd7ed558ccd);
+        h1 ^= h1 >> 33;
+        h1 = h1.wrapping_mul(0xc4ceb9fe1a85ec53);
+        h1 ^= h1 >> 33;
 
-        let mut index_to_taxid: Vec<u32> = Vec::new();
-        let mut taxid_to_index: HashMap<u32, u8> = HashMap::new();
-        for (i, &taxid) in unique_taxids.iter().enumerate() {
-            index_to_taxid.push(taxid);
-            taxid_to_index.insert(taxid, i as u8);
-        }
+        let mut h2 = item;
+        h2 ^= h2 >> 31;
+        h2 = h2.wrapping_mul(0x85ebca6b);
+        h2 ^= h2 >> 13;
+        h2 = h2.wrapping_mul(0xc2b2ae35);
+        h2 ^= h2 >> 16;
+        h2 |= 1;
 
-        eprintln!("  {} unique minimizers", num_minimizers);
-        if num_minimizers == 0 {
-            anyhow::bail!("No minimizers found");
-        }
+        (h1, h2)
+    }
 
-        eprintln!("\nGenerating Ancestry Matrix...");
-        let n = index_to_taxid.len();
-        let mut ancestor_matrix = vec![0u8; n * n];
-        
-        for i in 0..n {
-            for j in 0..n {
-                let parent_taxid = index_to_taxid[i];
-                let child_taxid = index_to_taxid[j];
-                
-                if parent_taxid == child_taxid {
-                    ancestor_matrix[i * n + j] = 1;
-                } else {
-                    let path = taxonomy.lineage_path(child_taxid);
-                    if path.contains(&parent_taxid) {
-                        ancestor_matrix[i * n + j] = 1;
-                    }
-                }
-            }
-        }
+    pub fn load(path: &str) -> Result<Self> {
+        let f = File::open(path)?;
+        let mut reader = BufReader::new(f);
+        bincode::deserialize_from(&mut reader).map_err(Into::into)
+    }
 
-        // Build MPHF
-        eprintln!("\nBuilding MPHF ({} keys)", num_minimizers);
-        let keys: Vec<u64> = minimizer_maps.iter().flat_map(|m| m.keys().copied()).collect();
-        let mphf = Mphf::new(2.0, &keys);
-        drop(keys);
+    pub fn popcount(&self) -> u64 {
+        self.data.iter().map(|b| b.count_ones() as u64).sum()
+    }
 
-        // Populate lookup arrays
-        eprintln!("\nPopulating arrays (consuming maps to save memory)");
-        let mut fingerprints = vec![0u16; num_minimizers];
-        let mut taxid_indices = vec![0u8; num_minimizers];
-        let mut accessions = self.track_accessions
-            .then(|| EqClassAccessions::new_empty(num_minimizers));
-        let mut hash_to_class: FxHashMap<u64, u32> = FxHashMap::default();
-        // Temporary build map: mphf_idx -> class_id (only during build, dropped before save)
-        let mut build_map: FxHashMap<u32, u32> = FxHashMap::default();
-
-        for map in minimizer_maps {
-            for (minimizer, entry) in map {
-                let idx = mphf.hash(&minimizer) as usize;
-                if idx < num_minimizers {
-                    fingerprints[idx] = compute_fingerprint(minimizer);
-                    taxid_indices[idx] = taxid_to_index[&entry.taxid];
-
-                    if let Some(ref mut acc) = accessions {
-                        if !entry.accessions_vbyte.is_empty() {
-                            let mut pos = 0;
-                            let decoded = delta_vbyte_decode(&entry.accessions_vbyte, &mut pos);
-                            acc.add_accessions(idx, &decoded, &mut hash_to_class, &mut build_map);
-                        }
-                    }
-                }
-            }
-        }
-
-        drop(hash_to_class);
-
-        if let Some(ref mut acc) = accessions {
-            eprintln!(
-                "  Equivalence classes: {} unique sets for accessions",
-                acc.num_classes - 1
-            );
-            acc.finalize_for_save(build_map);
-        } else {
-            drop(build_map);
-        }
-
-        eprintln!("\nDone building in {:.2}s", start.elapsed().as_secs_f64());
-
-        Ok(KmerDatabase {
-            k: self.k, l: self.l,
-            spaced_seed_mask: self.spaced_seed_mask,
-            toggle_mask: self.toggle_mask,
-            num_minimizers, mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions,
-        })
+    pub fn estimated_fpr(&self) -> f64 {
+        let fill = self.popcount() as f64 / self.num_bits as f64;
+        fill.powf(self.num_hashes as f64)
     }
 }
 
-pub struct MinimizerEntry {
-    pub taxid: u32,
-    pub conflicted: bool,
-    pub accessions_vbyte: Box<[u8]>,
+pub struct Hit {
+    pub taxid_idx: u8,
+    pub accession_class_id: Option<u32>,
+    pub is_hit: bool,
+    pub bg_taxid: u32, 
 }

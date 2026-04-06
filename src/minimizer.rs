@@ -38,7 +38,6 @@ impl MinimizerScanner {
         }
     }
 
-    // here i am extracting rc the same way as kraken2, in 5 ops
     pub fn scan_into(&self, seq: &[u8], out: &mut Vec<u64>) {
         out.clear();
 
@@ -46,7 +45,9 @@ impl MinimizerScanner {
             return;
         }
 
-        out.reserve(seq.len() - self.k + 1);
+        let num_kmers = seq.len() - self.k + 1;
+        out.reserve(num_kmers);
+
         let mut queue = RingDeque::new();
 
         let k = self.k;
@@ -68,62 +69,68 @@ impl MinimizerScanner {
                 rc_lmer = 0;
                 valid = 0;
                 queue.clear();
+
+                // Still emit for any k-mer window ending at this base
+                if i + 1 >= k {
+                    out.push(u64::MAX);
+                }
                 continue;
             }
 
             lmer = ((lmer << 2) | code as u64) & lmer_mask;
-
-            //here complement of code is 3- code
             rc_lmer = (rc_lmer >> 2) | (((3 - code) as u64) << rc_shift);
-
             valid += 1;
 
-            if valid < l {
+            if valid >= l {
+                let can_lmer = lmer.min(rc_lmer);
+                let mut can = can_lmer;
+                if has_spaced_seed {
+                    can &= spaced_seed_mask;
+                }
+                let candidate = can ^ toggle_mask;
+
+                while !queue.is_empty() && queue.back().0 > candidate {
+                    queue.pop_back();
+                }
+                let pos = (i + 1 - l) as u32;
+                queue.push_back((candidate, pos));
+
+                let window_start = if (pos as usize) + l >= k {
+                    (pos as usize + l - k) as u32
+                } else {
+                    0
+                };
+
+                while !queue.is_empty() && queue.front().1 < window_start {
+                    queue.pop_front();
+                }
+            }
+
+            if i + 1 < k {
                 continue;
             }
 
-            let can_lmer = lmer.min(rc_lmer);
-
-            let mut can = can_lmer;
-            if has_spaced_seed {
-                can &= spaced_seed_mask;
-            }
-            let candidate = can ^ toggle_mask;
-
-            // I am using deque algorithm here. the queue is always in the descending order.
-            // when you are adding a candidate to the queue, compare it to the back, and if it's smaller
-            // then we know that the back will never be the window minimum, pop it. then check the next back again
-            // if finally bigger, then you just add it.
-            // so it's amortized O(1), 
-            while !queue.is_empty() && queue.back().0 > candidate {
-                queue.pop_back();
-            }
-            let pos = (i + 1 - l) as u32;
-            queue.push_back((candidate, pos));
-
-            let window_start = if (pos as usize) + l >= k {
-                (pos as usize + l - k) as u32
-            } else {
-                0
-            };
-
-            // remove the front, if it now falls outside the window. this might be the minimizer too
-            while !queue.is_empty() && queue.front().1 < window_start {
-                queue.pop_front();
-            }
-
-            // Emit minimizer when we have a full k-mer window
-            if i + 1 >= k {
+            if valid >= k - 1 && !queue.is_empty() {
                 let (min_val, _) = queue.front();
                 out.push(min_val ^ toggle_mask);
+            } else {
+                out.push(u64::MAX);
             }
         }
+
+        debug_assert_eq!(
+            out.len(),
+            num_kmers,
+            "scan_into output length {} != expected {} for seq len {}",
+            out.len(),
+            num_kmers,
+            seq.len()
+        );
     }
 
     pub fn k(&self) -> usize {
         self.k
     }
-    
 }
 
 // spaced seed mask from a bit pattern string like "1111111111111111111110101010101"

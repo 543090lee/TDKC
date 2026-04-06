@@ -19,6 +19,9 @@ flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 crossbeam-channel = "0.5"
 itertools = "0.12"
 libc = "0.2"
+memmap2 = "0.9"
+fastbloom = { version = "0.17", features = ["serde"] }
+hyperloglogplus = "0.4"
 
 [profile.release]
 opt-level = 3

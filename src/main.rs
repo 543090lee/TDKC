@@ -1,9 +1,11 @@
 mod build;
 mod database;
 mod minimizer;
+mod prep;
 mod query;
 mod taxonomy;
 mod utils;
+mod build_domain;
 
 use clap::{Parser, Subcommand};
 
@@ -18,13 +20,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Build {
-        /// kraken output file
-        #[arg(short = 'k', long)]
-        kraken: String,
 
+    Prep {
         #[arg(short = 'f', long)]
         fasta: String,
+
+
+        #[arg(short = 'x', long, num_args = 1.., required = true)]
+        accession2taxid: Vec<String>,
+
+        #[arg(short = 't', long)]
+        targets: String,
+
+        #[arg(short = 'n', long)]
+        nodes: String,
+
+        #[arg(short = 'o', long)]
+        output_dir: String,
+    },
+
+    Build {
+        #[arg(short = 'f', long)]
+        fasta: String,
+
+        #[arg(long)]
+        target_fasta: String,
+
+        #[arg(long)]
+        prelim_map: String,
 
         #[arg(short = 't', long)]
         targets: String,
@@ -46,7 +69,6 @@ enum Commands {
 
         #[arg(short = 'a', long)]
         accession: bool,
-
     },
 
     Query {
@@ -65,11 +87,41 @@ enum Commands {
         #[arg(short = 'a', long)]
         accession: bool,
 
-        #[arg(short = 'm', long, default_value_t = 2)]
-        min_distinct_minimizers: usize,
+        #[arg(short = 'g', long, default_value_t = 2)]
+        minimum_hit_groups: usize,
 
         #[arg(short = 'o', long)]
         output_prefix: String,
+
+        #[arg(short = 'b', long)]
+        background: bool,
+    },
+
+    /// Build optional probabilistic Bloom filters for background domains.
+    BuildDomain {
+        /// Prefix of the target database (used ONLY to read k/l parameters from the .meta file)
+        #[arg(short = 'd', long)]
+        db: String,
+
+        /// Number of threads
+        #[arg(short = 'j', long, default_value_t = num_cpus::get())]
+        threads: usize,
+
+        /// FASTA file for Bacteria
+        #[arg(long)]
+        bacteria: Option<String>,
+
+        /// FASTA file for Archaea
+        #[arg(long)]
+        archaea: Option<String>,
+
+        /// FASTA file for Viral/Plasmids
+        #[arg(long)]
+        viral: Option<String>,
+
+        /// FASTA file for Fungi
+        #[arg(long)]
+        fungi: Option<String>,
     },
 }
 
@@ -77,9 +129,26 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build {
-            kraken,
+        Commands::Prep {
             fasta,
+            accession2taxid,
+            targets,
+            nodes,
+            output_dir,
+        } => {
+            prep::run_prep(prep::PrepConfig {
+                fasta_file: fasta,
+                accession2taxid_files: accession2taxid,
+                targets_file: targets,
+                nodes_file: nodes,
+                output_dir,
+            })?;
+        }
+
+        Commands::Build {
+            fasta,
+            target_fasta,
+            prelim_map,
             targets,
             nodes,
             output,
@@ -89,15 +158,16 @@ fn main() -> anyhow::Result<()> {
             minimizer_size,
         } => {
             build::run_build(build::BuildConfig {
-                kraken_file: kraken,
                 fasta_file: fasta,
+                target_fasta_file: target_fasta,
+                prelim_map_file: prelim_map,
                 targets_file: targets,
                 nodes_file: nodes,
                 db_prefix: output,
                 threads,
                 track_accessions: accession,
                 k: window_size,
-                l: minimizer_size
+                l: minimizer_size,
             })?;
         }
 
@@ -107,8 +177,9 @@ fn main() -> anyhow::Result<()> {
             read2,
             threads,
             accession,
-            min_distinct_minimizers,
+            minimum_hit_groups,
             output_prefix,
+            background
         } => {
             query::run_query(query::QueryConfig {
                 db_prefix: db,
@@ -116,8 +187,27 @@ fn main() -> anyhow::Result<()> {
                 read2_file: read2,
                 threads,
                 use_accessions: accession,
-                min_distinct_minimizers,
-                output_prefix: output_prefix,
+                minimum_hit_groups,
+                output_prefix,
+                background
+            })?;
+        }
+
+        Commands::BuildDomain {
+            db,
+            threads,
+            bacteria,
+            archaea,
+            viral,
+            fungi,
+        } => {
+            build_domain::run_build_domain(build_domain::BuildDomainConfig {
+                db_prefix: db,
+                threads,
+                bacteria,
+                archaea,
+                viral,
+                fungi,
             })?;
         }
     }
