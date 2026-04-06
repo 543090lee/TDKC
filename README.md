@@ -132,11 +132,11 @@ Activate at query time with `-b` to label non-target reads by broad domain.
 ## Citation
 
 ```bibtex
-@article{lee2025tdkc,
-  title   = {TDKC: Memory-Efficient and Fast Sequence Classification
+@article{lee2026tdkc,
+  title   = {TDKC: Fast and Memory-Efficient Sequence Classification
              for Target Pathogen Diagnostics},
   author  = {Lee, Seungmo and Eskin, Eleazar},
-  year    = {2025},
+  year    = {2026},
   url     = {https://github.com/543090lee/TDKC}
 }
 ```
