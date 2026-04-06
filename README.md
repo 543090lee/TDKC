@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./tdkc_logo.png" width="220" alt="TDKC Logo"/>
+<img src="./tdkc_logo.png" width="500" alt="TDKC Logo"/>
 
 # TDKC
 
@@ -117,7 +117,7 @@ Activate at query time with `-b` to label non-target reads by broad domain.
 
 | File | Description |
 |------|-------------|
-| `refseq.fna.gz` | Full reference FASTA (NCBI RefSeq + Viral NT) |
+| `refseq.fna` | Full reference FASTA (NCBI RefSeq) |
 | `targets.txt` | One NCBI taxid per line (any rank — genus, species, etc.) |
 | `nodes.dmp` | NCBI taxonomy `nodes.dmp` |
 | `nucl_gb.accession2taxid` | NCBI accession→taxid mapping |
@@ -126,17 +126,6 @@ Activate at query time with `-b` to label non-target reads by broad domain.
 **Viral NT:** https://ftp.ncbi.nlm.nih.gov/genomes/Viruses/AllNucleotide/  
 **Taxonomy:** https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/
 
----
-
-## Output Format
-
-**Per-read (`.tsv`)**
-```
-read1   147711   147711-{NC_038311.1,PX761384.1,...}:17
-```
-Fields: read name · assigned taxid · hit detail string (accessions + counts when `-a` enabled)
-
-**Report (`.report`):** Kraken2-compatible summary with read counts per taxon.
 
 ---
 
@@ -156,4 +145,4 @@ Fields: read name · assigned taxid · hit detail string (accessions + counts wh
 
 ## License
 
-MIT © Seungmo Lee & Eleazar Eskin · UCLA Department of Computer Science
+MIT © Seungmo Lee & Eleazar Eskin 
