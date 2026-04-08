@@ -37,7 +37,7 @@ TDKC has three main steps: `prep` → `build` → `query`.
 
 ### 1. Prep
 
-Extract target sequences and build an accession→taxid map.
+Extract target sequences and build an accession to taxid map.
 
 ```bash
 tdkc prep \
@@ -89,7 +89,7 @@ tdkc query \
   -o results/sample
 ```
 
-Outputs: `results/sample.tsv` (per-read) and `results/sample.report` (summary).
+Outputs: `results/sample.output` (per-read) and `results/sample.report` (overall result).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -106,10 +106,11 @@ tdkc build-domain \
   -d my_db \
   --bacteria /data/bacteria.fna \
   --viral    /data/viral.fna \
+  --archaea /data/archaea.fna
   -j 32
 ```
 
-Activate at query time with `-b` to label non-target reads by broad domain.
+Activate at query time with `-b` to classify against broad domains too.
 
 ---
 
@@ -120,7 +121,7 @@ Activate at query time with `-b` to label non-target reads by broad domain.
 | `refseq.fna` | Full reference FASTA (NCBI RefSeq) |
 | `targets.txt` | One NCBI taxid per line (any rank — genus, species, etc.) |
 | `nodes.dmp` | NCBI taxonomy `nodes.dmp` |
-| `nucl_gb.accession2taxid` | NCBI accession→taxid mapping |
+| `nucl_gb.accession2taxid` `nucl_wgs.accession2taxid` | NCBI accession→taxid mapping |
 
 **RefSeq:** https://ftp.ncbi.nlm.nih.gov/genomes/refseq/  
 **Viral NT:** https://ftp.ncbi.nlm.nih.gov/genomes/Viruses/AllNucleotide/  
@@ -145,4 +146,4 @@ Activate at query time with `-b` to label non-target reads by broad domain.
 
 ## License
 
-MIT © Seungmo Lee & Eleazar Eskin 
+MIT © Seungmo Lee

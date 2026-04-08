@@ -10,8 +10,8 @@ mod build_domain;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "kmer-db")]
-#[command(about = "Target Distilled K-mer Classifier")]
+#[command(name = "tdkc")]
+#[command(about = "TDKC (Target Distilled K-mer Classifier) - Fast and Memory-Efficient Metagenomic Classification for Target Pathogen Diagnostics")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
