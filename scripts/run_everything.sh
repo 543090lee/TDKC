@@ -34,4 +34,4 @@ for r1 in "$INPUT_DIR"/*_R1_*.fastq.gz; do
     count=$((count + 1))
 done
 
-echo "Done, and processed $count samples."
+echo "Processed $count samples."

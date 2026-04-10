@@ -19,7 +19,11 @@
 
 ## Installation
 
-**Prerequisites:** [Rust ≥ 1.70](https://rustup.rs/), [`seqtk`](https://github.com/lh3/seqtk), [`ripgrep`](https://github.com/BurntSushi/ripgrep)
+**Prerequisites:**
+- [Rust ≥ 1.70](https://rustup.rs/)
+- [`seqtk`](https://github.com/lh3/seqtk): `conda install -c bioconda seqtk`
+- [`ripgrep`](https://github.com/BurntSushi/ripgrep): `cargo install ripgrep`
+
 
 ```bash
 git clone https://github.com/543090lee/TDKC.git
@@ -61,13 +65,14 @@ tdkc build \
   -f /data/refseq.fna.gz \
   --target-fasta prep_output/target.fasta \
   --prelim-map   prep_output/prelim_map.txt \
-  -t targets.txt \
+  -t /data/targets.txt \
   -n nodes.dmp \
   -o my_db \
   -j 32
 ```
 
 Add `-a` to enable per-minimizer accession tracking (TDKC-A mode).
+You can find `targets.txt` in the `data` directory. Target taxa list is made of most common human respiratory and enteric viruses. Feel free to use it! 
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -89,7 +94,7 @@ tdkc query \
   -o results/sample
 ```
 
-Outputs: `results/sample.output` (per-read) and `results/sample.report` (overall result).
+Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
