@@ -239,6 +239,15 @@ fn classify_batch(
             (0, false)
         };
 
+        let mut write_prefix = |out: &mut Vec<u8>, status: &str, taxid: &dyn std::fmt::Display| {
+            let header_str = unsafe { std::str::from_utf8_unchecked(&header1) };
+            if is_paired {
+                let _ = write!(out, "{}\t{}\t{}\t{}|{}\t", status, header_str, taxid, seq1.len(), seq2_len);
+            } else {
+                let _ = write!(out, "{}\t{}\t{}\t{}\t", status, header_str, taxid, seq1.len());
+            }
+        };
+
         let mut valid_hits: usize = 0;
         let mut taxid_counts = [0u32; 256];
         let mut bg_counts = FxHashMap::default();
@@ -301,13 +310,9 @@ fn classify_batch(
 
         let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, 1);
 
+        //Unclassified
         if valid_hits == 0 || effective_hit_groups < min_hit_groups {
-            if is_paired {
-                let _ = write!(local_output, "U\t{}\t0\t{}|{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, seq1.len(), seq2_len);
-            } else {
-                let _ = write!(local_output, "U\t{}\t0\t{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, seq1.len());
-            }
-
+            write_prefix(&mut local_output, "U", &0);
             write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
             if has_r2 {
                 local_output.extend_from_slice(b" |:| ");
@@ -398,13 +403,10 @@ fn classify_batch(
                     }
                 }
 
+                // Classified
                 if let Some(final_idx) = resolved_taxid_idx {
                     let best_taxid = db.true_taxid(final_idx);
-                    if is_paired {
-                        let _ = write!(local_output, "C\t{}\t{}\t{}|{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, best_taxid, seq1.len(), seq2_len);
-                    } else {
-                        let _ = write!(local_output, "C\t{}\t{}\t{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, best_taxid, seq1.len());
-                    }
+                    write_prefix(&mut local_output, "C", &best_taxid);
                     write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
                     if has_r2 {
                         local_output.extend_from_slice(b" |:| ");
@@ -416,11 +418,8 @@ fn classify_batch(
                 } else {
                     // no LCA then it's ambiguous
                     let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
-                    if is_paired {
-                        let _ = write!(local_output, "A\t{}\t{}\t{}|{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, tied_taxids_str, seq1.len(), seq2_len);
-                    } else {
-                        let _ = write!(local_output, "A\t{}\t{}\t{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, tied_taxids_str, seq1.len());
-                    }
+                    let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
+                    write_prefix(&mut local_output, "A", &tied_taxids_str);
                     write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
                     if has_r2 {
                         local_output.extend_from_slice(b" |:| ");
@@ -449,12 +448,8 @@ fn classify_batch(
                     else { TAXID_ROOT }
                 };
 
-                if is_paired {
-                    let _ = write!(local_output, "C\t{}\t{}\t{}|{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, final_bg_taxid, seq1.len(), seq2_len);
-                } else {
-                    let _ = write!(local_output, "C\t{}\t{}\t{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, final_bg_taxid, seq1.len());
-                }
-                
+                // background classified
+                write_prefix(&mut local_output, "C", &final_bg_taxid);
                 write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
                 if has_r2 {
                     local_output.extend_from_slice(b" |:| ");
