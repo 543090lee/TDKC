@@ -1,16 +1,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-
+use std::time::Instant;
 use anyhow::Result;
 use boomphf::Mphf;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-
-use crate::database::{AccessionRegistry, EqClassAccessions, KmerDatabase};
-use crate::minimizer::{create_spaced_seed_mask, MinimizerScanner};
+use crate::database::{AccessionRegistry, EqClassAccessions, KmerDatabase,compute_fingerprint};
+use crate::minimizer::{create_spaced_seed_mask, MinimizerScanner, SPACED_PATTERN, TOGGLE_MASK};
 use crate::prep::load_prelim_map;
 use crate::taxonomy::{load_target_taxids, BfsTaxonomy, TargetTaxIDManager, TaxonomyTree};
+use crate::utils::init_thread_pool;
 
 pub struct BuildConfig {
     pub fasta_file: String,
@@ -25,46 +24,30 @@ pub struct BuildConfig {
     pub l: usize,
 }
 
-const SPACED_PATTERN: &str = "1111111111111111101010101010101";
-const TOGGLE_MASK: u64 = 0xe37e28c4271b5a2d;
-
 const NUM_SHARDS: usize = 256;
 const SHARD_SHIFT: usize = 56;
-
 const BATCH_ITEM_LIMIT: usize = 2048;
 const BATCH_BYTE_LIMIT: usize = 256 * 1024 * 1024;
-
 const PAR_CHUNK_SIZE: usize = 64;
-
 const SEG_TARGET_LEN: usize = 4 * 1024 * 1024;
 
 pub fn run_build(config: BuildConfig) -> Result<()> {
     let spaced_seed_mask = create_spaced_seed_mask(SPACED_PATTERN);
-
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(config.threads)
-        .build_global()
-        .ok();
+    init_thread_pool(config.threads);
 
     let total_start = Instant::now();
 
-    eprintln!("Phase 0: Loading taxonomy...");
+    eprintln!("Loading taxonomy...");
     let taxonomy = TaxonomyTree::load(&config.nodes_file)?;
-    log_mem("Loaded TaxonomyTree");
 
     eprintln!("Loading target TaxIDs...");
     let targets = load_target_taxids(&config.targets_file)?;
     let taxid_manager = TargetTaxIDManager::new(&targets, &taxonomy);
     let relevant_taxids = taxid_manager.all_relevant_taxids();
-    log_mem("Loaded Targets and Manager");
-
-    eprintln!("Building BFS taxonomy with internal IDs...");
     let bfs_tax = BfsTaxonomy::build(&taxonomy, &relevant_taxids);
-    log_mem("Built BFS Taxonomy");
 
     eprintln!("\nLoading prelim_map...");
     let acc_to_taxid = load_prelim_map(&config.prelim_map_file)?;
-    log_mem("Loaded prelim_map");
 
     let acc_to_internal: HashMap<String, u32> = acc_to_taxid
         .iter()
@@ -76,7 +59,6 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         "  {} accessions have taxids in taxonomy tree",
         acc_to_internal.len()
     );
-    log_mem("Built acc_to_internal mapping");
 
     let target_accessions: HashSet<String> = acc_to_internal
         .iter()
@@ -87,29 +69,25 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         "  {} accessions belong to target clades",
         target_accessions.len()
     );
-    log_mem("Filtered target_accessions");
 
     let scanner = MinimizerScanner::new(config.k, config.l, spaced_seed_mask, TOGGLE_MASK);
 
     let mut accession_registry = if config.track_accessions {
-        eprintln!("\nSorting accessions by taxonomic lineage...");
         let reg = presort_accessions_by_lineage(
             &target_accessions,
             &acc_to_taxid,
             &taxonomy,
             &taxid_manager,
         )?;
-        log_mem("Built AccessionRegistry");
         Some(reg)
     } else {
         None
     };
 
-    eprintln!("\nPhase 2: Extracting minimizers from target sub-FASTA...");
+    eprintln!("\nExtracting target minimizers...");
     let global = ShardedMinimizerMap::new();
-    log_mem("Initialized ShardedMinimizerMap (Empty)");
 
-    phase2_extract_target_minimizers(
+    extract_target_minimizers(
         &config.target_fasta_file,
         &target_accessions,
         &acc_to_internal,
@@ -119,17 +97,15 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         config.track_accessions,
         &mut accession_registry,
     )?;
-    log_mem("Finished Phase 2 (Peak minimizer extraction)");
 
     let total_target_minimizers: usize = global
         .shards
         .iter()
         .map(|s| s.read().unwrap().len())
         .sum();
-    eprintln!("  {} base target minimizers", total_target_minimizers);
 
-    eprintln!("\nPhase 3: Challenging minimizers with background sequences...");
-    let to_remove = phase3_collect_background_hits(
+    eprintln!("\nChallenging minimizers...");
+    let to_remove = collect_background_hits(
         &config.fasta_file,
         &target_accessions,
         &scanner,
@@ -137,12 +113,10 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     )?;
 
     let remove_count = to_remove.len();
-    eprintln!("  {} minimizers found in background, removing...", remove_count);
-    log_mem("Collected Phase 3 background hits");
+    eprintln!("  {} minimizers found in non-target, removing...", remove_count);
 
-    phase3_bulk_remove(&global, &to_remove);
+    challenge_bulk_remove(&global, &to_remove);
     drop(to_remove);
-    log_mem("Completed Phase 3 bulk remove");
 
     let total_surviving: usize = global
         .shards
@@ -150,12 +124,11 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         .map(|s| s.read().unwrap().len())
         .sum();
     eprintln!(
-        "  {} minimizers survived ({} removed by challenge)",
+        "  {} minimizers survived, abd {} removed by challenge",
         total_surviving,
         total_target_minimizers.saturating_sub(total_surviving)
     );
 
-    eprintln!("\nPhase 4: Building database directly from sharded map...");
     let db = build_database_from_shards(
         global,
         &bfs_tax,
@@ -167,10 +140,8 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         TOGGLE_MASK,
         config.track_accessions,
     )?;
-    log_mem("Built Final KmerDatabase in Memory");
 
     db.save(&config.db_prefix)?;
-    log_mem("Saved KmerDatabase to disk");
 
     if let Some(reg) = accession_registry {
         reg.save(&format!("{}.accessions", config.db_prefix))?;
@@ -197,9 +168,6 @@ fn build_database_from_shards(
 ) -> Result<KmerDatabase> {
     let start = Instant::now();
     eprintln!("\nBuilding k-mer database");
-
-    // ── Pass 1: Scan shards to collect unique taxids and count ───────────────
-    eprintln!("\nCreating TaxID mapping (scanning shards)...");
     let mut unique_taxids = BTreeSet::new();
     let mut num_minimizers: usize = 0;
 
@@ -216,7 +184,7 @@ fn build_database_from_shards(
         }
     }
 
-    eprintln!("  Found {} unique TaxIDs", unique_taxids.len());
+    eprintln!("  Found {} unique taxIDs", unique_taxids.len());
     eprintln!("  {} unique minimizers", num_minimizers);
 
     if unique_taxids.len() > 255 {
@@ -235,8 +203,6 @@ fn build_database_from_shards(
         index_to_taxid.push(taxid);
         taxid_to_index.insert(taxid, i as u8);
     }
-
-    eprintln!("\nGenerating Ancestry Matrix...");
     let n = index_to_taxid.len();
     let mut ancestor_matrix = vec![0u8; n * n];
     for i in 0..n {
@@ -253,8 +219,6 @@ fn build_database_from_shards(
             }
         }
     }
-
-    eprintln!("\nCollecting keys for MPHF ({} keys)...", num_minimizers);
     let mut keys: Vec<u64> = Vec::with_capacity(num_minimizers);
     for shard_lock in &global.shards {
         let shard = shard_lock.read().unwrap();
@@ -264,14 +228,12 @@ fn build_database_from_shards(
             }
         }
     }
-    log_mem("Collected MPHF keys");
 
     eprintln!("Building MPHF...");
     let mphf = Mphf::new(2.0, &keys);
     drop(keys);
-    log_mem("Built MPHF (keys dropped)");
 
-    eprintln!("\nPopulating arrays (consuming shards to free memory)...");
+    eprintln!("\nPopulating arrays...");
     let mut fingerprints = vec![0u16; num_minimizers];
     let mut taxid_indices = vec![0u8; num_minimizers];
     let mut accessions = track_accessions
@@ -308,20 +270,11 @@ fn build_database_from_shards(
                 }
             }
         }
-
-        if (shard_idx + 1) % 64 == 0 {
-            log_mem(&format!("  Consumed {}/{} shards", shard_idx + 1, NUM_SHARDS));
-        }
     }
-    log_mem("All shards consumed, arrays populated");
 
     drop(hash_to_class);
 
     if let Some(ref mut acc) = accessions {
-        eprintln!(
-            "  Equivalence classes: {} unique sets for accessions",
-            acc.num_classes - 1
-        );
         acc.finalize_for_save(build_map);
     } else {
         drop(build_map);
@@ -343,15 +296,6 @@ fn build_database_from_shards(
         accessions,
     ))
 }
-
-#[inline]
-fn compute_fingerprint(mut kmer: u64) -> u16 {
-    kmer ^= kmer >> 33;
-    kmer = kmer.wrapping_mul(0xff51afd7ed558ccd);
-    kmer ^= kmer >> 33;
-    (kmer & 0xFFFF) as u16
-}
-
 
 fn presort_accessions_by_lineage(
     target_accessions: &HashSet<String>,
@@ -383,11 +327,6 @@ fn presort_accessions_by_lineage(
     for (seq_id, _) in &accession_seqs {
         registry.get_or_create(seq_id);
     }
-
-    eprintln!(
-        "  Pre-assigned {} accession IDs in taxonomic order",
-        registry.len()
-    );
     Ok(registry)
 }
 
@@ -410,7 +349,6 @@ impl ShardedMinimizerMap {
         }
     }
 }
-
 #[inline(always)]
 fn shard_for(minimizer: u64) -> usize {
     (minimizer >> SHARD_SHIFT) as usize & (NUM_SHARDS - 1)
@@ -483,8 +421,6 @@ fn dedup_lca(entries: &mut Vec<(u64, u32)>, bfs_tax: &BfsTaxonomy) {
     });
 }
 
-// ─── Work items ─────────────────────────────────────────────────────────────
-
 struct WorkItem {
     seq_data: Arc<Vec<u8>>,
     start: usize,
@@ -526,8 +462,7 @@ fn segment_ranges(seq_len: usize, k: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-
-fn phase2_extract_target_minimizers(
+fn extract_target_minimizers(
     target_fasta_path: &str,
     target_accessions: &HashSet<String>,
     acc_to_internal: &HashMap<String, u32>,
@@ -553,15 +488,10 @@ fn phase2_extract_target_minimizers(
         let mut work_items: Vec<WorkItem> = Vec::new();
         let mut acc_records: Vec<AccRecord> = Vec::new();
         let mut batch_bytes = 0usize;
-        let mut total_seqs = 0u64;
-        let mut total_segments = 0u64;
-        let mut last_log = Instant::now();
 
         while let Some(record) = reader.next() {
             let rec = record.map_err(|e| anyhow::anyhow!("FASTA error: {}", e))?;
-            let id_full = std::str::from_utf8(rec.id()).unwrap_or("");
-            let accession = id_full.split_whitespace().next().unwrap_or("");
-            total_seqs += 1;
+            let accession = crate::utils::extract_accession(rec.id());
 
             let int_taxid = match acc_int.get(accession) {
                 Some(&id) => id,
@@ -581,8 +511,6 @@ fn phase2_extract_target_minimizers(
             }
 
             let ranges = segment_ranges(seq_len, k);
-            let num_segs = ranges.len();
-            total_segments += num_segs as u64;
 
             for (start, end) in ranges {
                 batch_bytes += end - start;
@@ -592,15 +520,6 @@ fn phase2_extract_target_minimizers(
                     end,
                     int_taxid,
                 });
-            }
-
-            if num_segs > 1 && seq_len > 100_000_000 {
-                eprintln!(
-                    "    Split {} ({:.0} MB) into {} segments",
-                    accession,
-                    seq_len as f64 / 1_048_576.0,
-                    num_segs
-                );
             }
 
             if work_items.len() >= BATCH_ITEM_LIMIT || batch_bytes >= BATCH_BYTE_LIMIT {
@@ -615,23 +534,11 @@ fn phase2_extract_target_minimizers(
                 }
                 batch_bytes = 0;
             }
-
-            if last_log.elapsed() > Duration::from_secs(5) {
-                eprint!(
-                    "\r  Phase 2: {} seqs ({} work items)...",
-                    total_seqs, total_segments
-                );
-                last_log = Instant::now();
-            }
         }
 
         if !work_items.is_empty() || !acc_records.is_empty() {
             let _ = tx.send((work_items, acc_records));
         }
-        eprintln!(
-            "\r  Phase 2: {} target seqs, {} work items",
-            total_seqs, total_segments
-        );
         Ok(())
     });
 
@@ -696,25 +603,25 @@ fn phase2_extract_target_minimizers(
     match reader_handle.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!("Phase 2 reader thread panicked"),
+        Err(_) => anyhow::bail!("reader thread panicked"),
     }
 
     Ok(())
 }
-struct Phase3Segment {
+struct ChallengeSegment {
     seq_data: Arc<Vec<u8>>,
     start: usize,
     end: usize,
 }
 
-impl Phase3Segment {
+impl ChallengeSegment {
     #[inline]
     fn seq_slice(&self) -> &[u8] {
         &self.seq_data[self.start..self.end]
     }
 }
 
-fn phase3_collect_background_hits(
+fn collect_background_hits(
     fasta_path: &str,
     target_accessions: &HashSet<String>,
     scanner: &MinimizerScanner,
@@ -722,49 +629,30 @@ fn phase3_collect_background_hits(
 ) -> Result<Vec<u64>> {
     let k = scanner.k();
 
-    let (tx, rx) = crossbeam_channel::bounded::<Vec<Phase3Segment>>(4);
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<ChallengeSegment>>(4);
     let fasta_file = fasta_path.to_string();
     let target_acc = target_accessions.clone();
-
     let reader_handle = std::thread::spawn(move || -> Result<()> {
         let mut reader = needletail::parse_fastx_file(&fasta_file)
             .map_err(|e| anyhow::anyhow!("Cannot open FASTA: {}", e))?;
 
-        let mut work_items: Vec<Phase3Segment> = Vec::new();
+        let mut work_items: Vec<ChallengeSegment> = Vec::new();
         let mut batch_bytes = 0usize;
-        let mut total_seqs = 0u64;
-        let mut skipped_target = 0u64;
-        let mut background = 0u64;
-        let mut last_log = Instant::now();
 
         while let Some(record) = reader.next() {
             let rec = record.map_err(|e| anyhow::anyhow!("FASTA error: {}", e))?;
-            let id_full = std::str::from_utf8(rec.id()).unwrap_or("");
-            let accession = id_full.split_whitespace().next().unwrap_or("");
-            total_seqs += 1;
+            let accession = crate::utils::extract_accession(rec.id());
 
-            if target_acc.contains(accession) {
-                skipped_target += 1;
-                if last_log.elapsed() > Duration::from_secs(5) {
-                    eprint!(
-                        "\r  Phase 3: {}M seqs, {}M background, {}k target skipped...",
-                        total_seqs,
-                        background,
-                        skipped_target
-                    );
-                    last_log = Instant::now();
-                }
+            if target_acc.contains(accession) {                
                 continue;
             }
 
-            background += 1;
             let seq_data = Arc::new(rec.seq().into_owned());
             let seq_len = seq_data.len();
-
             let ranges = segment_ranges(seq_len, k);
             for (start, end) in ranges {
                 batch_bytes += end - start;
-                work_items.push(Phase3Segment {
+                work_items.push(ChallengeSegment {
                     seq_data: Arc::clone(&seq_data),
                     start,
                     end,
@@ -780,25 +668,10 @@ fn phase3_collect_background_hits(
                 }
                 batch_bytes = 0;
             }
-
-            if last_log.elapsed() > Duration::from_secs(5) {
-                eprint!(
-                    "\r  Phase 3: {}M seqs, {}M background, {}k target skipped...",
-                    total_seqs,
-                    background,
-                    skipped_target
-                );
-                last_log = Instant::now();
-            }
         }
-
         if !work_items.is_empty() {
             let _ = tx.send(work_items);
         }
-        eprintln!(
-            "\r  Phase 3: {} total seqs, {} background scanned, {} target skipped",
-            total_seqs, background, skipped_target
-        );
         Ok(())
     });
 
@@ -809,7 +682,7 @@ fn phase3_collect_background_hits(
             .par_chunks(PAR_CHUNK_SIZE)
             .fold(
                 || Vec::new(),
-                |mut local_hits: Vec<u64>, chunk: &[Phase3Segment]| {
+                |mut local_hits: Vec<u64>, chunk: &[ChallengeSegment]| {
                     let mut minimizer_buf: Vec<u64> = Vec::new();
 
                     for item in chunk {
@@ -823,7 +696,6 @@ fn phase3_collect_background_hits(
                             }
                         }
                     }
-
                     local_hits
                 },
             )
@@ -848,14 +720,12 @@ fn phase3_collect_background_hits(
         Ok(Err(e)) => return Err(e),
         Err(_) => anyhow::bail!("reader thread panicked"),
     }
-
     all_hits.sort_unstable();
     all_hits.dedup();
-
     Ok(all_hits)
 }
 
-fn phase3_bulk_remove(global: &ShardedMinimizerMap, to_remove: &[u64]) {
+fn challenge_bulk_remove(global: &ShardedMinimizerMap, to_remove: &[u64]) {
     let mut by_shard: Vec<Vec<u64>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
     for &m in to_remove {
         by_shard[shard_for(m)].push(m);
@@ -868,17 +738,6 @@ fn phase3_bulk_remove(global: &ShardedMinimizerMap, to_remove: &[u64]) {
         let mut shard = global.shards[shard_idx].write().unwrap();
         for m in removals {
             shard.remove(&m);
-        }
-    }
-}
-
-fn log_mem(step: &str) {
-    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(rss_pages) = statm.split_whitespace().nth(1) {
-            if let Ok(pages) = rss_pages.parse::<usize>() {
-                let rss_mb = (pages * 4096) as f64 / 1_048_576.0;
-                eprintln!("[MEM] {:.2} MB | {}", rss_mb, step);
-            }
         }
     }
 }

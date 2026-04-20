@@ -14,6 +14,9 @@ fn base_code(c: u8) -> u8 {
     BASE_LUT[c as usize]
 }
 
+pub const SPACED_PATTERN: &str = "1111111111111111101010101010101";
+pub const TOGGLE_MASK: u64 = 0xe37e28c4271b5a2d;
+
 pub struct MinimizerScanner {
     k: usize,
     l: usize,
@@ -25,8 +28,8 @@ pub struct MinimizerScanner {
 
 impl MinimizerScanner {
     pub fn new(k: usize, l: usize, spaced_seed_mask: u64, toggle_mask: u64) -> Self {
-        assert!(l <= 31, "l must be <= 31");
-        assert!(k >= l, "k must be >= l");
+        assert!(l <= 31, "l too big! l has to be <= 31");
+        assert!(k >= l, "k too small! k has to be >= l");
         let lmer_mask = (1u64 << (l * 2)) - 1;
         Self {
             k,
@@ -47,7 +50,6 @@ impl MinimizerScanner {
 
         let num_kmers = seq.len() - self.k + 1;
         out.reserve(num_kmers);
-
         let mut queue = RingDeque::new();
 
         let k = self.k;
@@ -70,7 +72,6 @@ impl MinimizerScanner {
                 valid = 0;
                 queue.clear();
 
-                // Still emit for any k-mer window ending at this base
                 if i + 1 >= k {
                     out.push(u64::MAX);
                 }
@@ -133,7 +134,7 @@ impl MinimizerScanner {
     }
 }
 
-// spaced seed mask from a bit pattern string like "1111111111111111111110101010101"
+// It has the same configuration as Kraken2's default space seed mask pattern
 pub fn create_spaced_seed_mask(pattern: &str) -> u64 {
     let mut mask: u64 = 0;
     for (pos, ch) in pattern.chars().rev().enumerate() {

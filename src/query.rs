@@ -7,6 +7,8 @@ use crate::database::{AccessionRegistry, DomainBloomFilter, KmerDatabase, Hit};
 use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
 use itertools::Itertools;
+use crate::utils::init_thread_pool;
+use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_CELLULAR, TAXID_FUNGI, TAXID_ROOT, TAXID_VIRAL};
 
 pub struct QueryConfig {
     pub db_prefix: String,
@@ -39,10 +41,7 @@ struct BatchResult {
 }
 
 pub fn run_query(config: QueryConfig) -> Result<()> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(config.threads)
-        .build_global()
-        .ok();
+    init_thread_pool(config.threads);
 
     let db_start = std::time::Instant::now();
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
@@ -50,10 +49,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     let mut bg_filters = Vec::new();
     if config.background {
         let domains = [
-            ("bacteria.bloom", 2),
-            ("archaea.bloom", 2157),
-            ("viral.bloom", 10239),
-            ("fungi.bloom", 4751)
+            ("bacteria.bloom", TAXID_BACTERIA),
+            ("archaea.bloom", TAXID_ARCHAEA),
+            ("viral.bloom", TAXID_VIRAL),
+            ("fungi.bloom", TAXID_FUNGI)
         ];
         for (ext, taxid) in domains {
             let path = format!("{}.{}", config.db_prefix, ext);
@@ -179,19 +178,19 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     }
 
     if c + u + a != num_records {
-        eprintln!("Warning C+U+A is not adding up to number of reads");
+        eprintln!("WARNING: C+U+A is not adding up to number of reads");
     }
 
     eprintln!("Classified:   {}", c);
     eprintln!("Ambiguous:    {}", a);
     eprintln!("Unclassified: {}", u);
     eprintln!("Total:        {}", num_records);
-    eprintln!("DB load:      {:.2}s", db_elapsed.as_secs_f64());
+    // eprintln!("DB load:      {:.2}s", db_elapsed.as_secs_f64());
     eprintln!("Classify:     {:.2}s", classify_elapsed.as_secs_f64());
-    eprintln!("Total time:   {:.2}s", db_elapsed.as_secs_f64() + classify_elapsed.as_secs_f64());
-    if classify_elapsed.as_secs_f64() > 0.0 {
-        eprintln!("Throughput:   {:.0} reads/s", num_records as f64 / classify_elapsed.as_secs_f64());
-    }
+    // eprintln!("Total time:   {:.2}s", db_elapsed.as_secs_f64() + classify_elapsed.as_secs_f64());
+    // if classify_elapsed.as_secs_f64() > 0.0 {
+    //     eprintln!("Throughput:   {:.0} reads/s", num_records as f64 / classify_elapsed.as_secs_f64());
+    // }
     Ok(())
 }
 
@@ -320,7 +319,6 @@ fn classify_batch(
         } else {
             let n = db.index_to_taxid.len();
             
-            // 1. Gather active target indices (skip looping over zeroes)
             let mut active_indices = Vec::new();
             for (idx, &count) in taxid_counts.iter().enumerate() {
                 if count > 0 && idx < n {
@@ -328,14 +326,13 @@ fn classify_batch(
                 }
             }
 
-            // 2. Matrix-Based Root-to-Leaf (RTL) Path Summation
             let mut path_weights = vec![0u32; n];
             let mut max_target_weight = 0;
 
             for i in 0..n {
                 let mut w = 0;
                 for &j in &active_indices {
-                    // If j is an ancestor of i (or j == i), its hits contribute to i's path
+                    // If j is an ancestor of i or vice versa, hit contribute to i's path
                     if db.is_ancestor(j, i as u8) {
                         w += taxid_counts[j as usize];
                     }
@@ -346,7 +343,6 @@ fn classify_batch(
                 }
             }
 
-            // 3. Find target nodes tied for the maximum path weight
             let mut best_target_nodes = Vec::new();
             if max_target_weight > 0 {
                 for i in 0..n {
@@ -356,7 +352,6 @@ fn classify_batch(
                 }
             }
 
-            // 4. Determine Background maximums
             let mut best_bg_taxids: Vec<u32> = Vec::new();
             let mut best_bg_count: u32 = 0;
             for (&taxid, &count) in &bg_counts {
@@ -369,7 +364,7 @@ fn classify_batch(
                 }
             }
 
-            // 5. TDKC Tie-Breaker: Specific Targets >= Background Sinks
+            // tie breaker
             if max_target_weight >= best_bg_count && max_target_weight > 0 {
                 
                 let mut resolved_taxid_idx: Option<u8> = None;
@@ -377,8 +372,7 @@ fn classify_batch(
                 if best_target_nodes.len() == 1 {
                     resolved_taxid_idx = Some(best_target_nodes[0]);
                 } else if best_target_nodes.len() > 1 {
-                    // Resolve tie by finding the Lowest Common Ancestor (LCA)
-                    // The LCA must be an ancestor of ALL tied nodes.
+                    // Doing LCA here, but LCA must be an ancestor all tied nodes
                     let mut candidate_lcas = Vec::new();
                     for k in 0..n {
                         let mut is_common = true;
@@ -393,7 +387,6 @@ fn classify_batch(
                         }
                     }
 
-                    // Find the deepest LCA (the one that is a descendant of the others)
                     if !candidate_lcas.is_empty() {
                         let mut lca_idx = candidate_lcas[0];
                         for &c in &candidate_lcas[1..] {
@@ -405,7 +398,6 @@ fn classify_batch(
                     }
                 }
 
-                // Write Target Output
                 if let Some(final_idx) = resolved_taxid_idx {
                     let best_taxid = db.true_taxid(final_idx);
                     if is_paired {
@@ -422,7 +414,7 @@ fn classify_batch(
                     *local_report.entry(best_taxid).or_default() += 1;
                     local_classified += 1;
                 } else {
-                    // Fallback if no LCA exists in the target DB
+                    // no LCA then it's ambiguous
                     let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
                     if is_paired {
                         let _ = write!(local_output, "A\t{}\t{}\t{}|{}\t", unsafe { std::str::from_utf8_unchecked(&header1) }, tied_taxids_str, seq1.len(), seq2_len);
@@ -440,7 +432,6 @@ fn classify_batch(
                 }
                 
             } else if best_bg_count > 0 {
-                // Background fallback resolution (Read-Level LCA)
                 let final_bg_taxid = if best_bg_taxids.len() == 1 {
                     best_bg_taxids[0]
                 } else {
@@ -448,14 +439,14 @@ fn classify_batch(
                     let mut hit_cellular = false;
                     
                     for &t in &best_bg_taxids {
-                        if t == 10239 || t == 1 { hit_viral = true; }
-                        if t == 2 || t == 2157 || t == 4751 || t == 131567 { hit_cellular = true; }
+                        if t == TAXID_VIRAL || t == TAXID_ROOT { hit_viral = true; }
+                        if t == TAXID_BACTERIA || t == TAXID_ARCHAEA || t == TAXID_FUNGI || t == TAXID_CELLULAR { hit_cellular = true; }
                     }
                     
-                    if hit_viral && hit_cellular { 1 } 
-                    else if hit_cellular { 131567 } 
-                    else if hit_viral { 10239 } 
-                    else { 1 }
+                    if hit_viral && hit_cellular { TAXID_ROOT } 
+                    else if hit_cellular { TAXID_CELLULAR } 
+                    else if hit_viral { TAXID_VIRAL } 
+                    else { TAXID_ROOT }
                 };
 
                 if is_paired {
@@ -547,16 +538,13 @@ fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel:
     let mut r1_reader = open_fastx(r1_path)?;
     loop {
         let recs1 = read_flat_batch(&mut r1_reader, batch_size)?;
-        // Check offsets to see if the batch is empty
         if recs1.offsets.is_empty() { break; }
-        // Use the new fields: batch1 and batch2
         if tx.send(ReadBatch { batch1: recs1, batch2: None }).is_err() { break; }
     }
     Ok(())
 }
 
 fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>) -> Result<()> {
-    // R2 decompresses in its own thread, sends FlatBatches to us
     let (r2_tx, r2_rx) = crossbeam_channel::bounded::<Option<FlatBatch>>(4);
     let r2_path_owned = r2_path.to_string();
     let bs = batch_size;
@@ -583,9 +571,9 @@ fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &cro
             Ok(None) => anyhow::bail!("R2 file ended before R1"),
             Err(_) => anyhow::bail!("R2 reader thread disconnected"),
         };
-        // Compare the offsets lengths
+
         if recs2.offsets.len() != recs1.offsets.len() {
-            anyhow::bail!("There is a read count mismatch: R1={}, R2={}", recs1.offsets.len(), recs2.offsets.len());
+            anyhow::bail!("There is a read count mismatch of paired end reads");
         }
         if tx.send(ReadBatch { batch1: recs1, batch2: Some(recs2) }).is_err() { break; }
     }
@@ -605,8 +593,7 @@ fn open_fastx(path: &str) -> Result<FastxReader> {
     Ok(reader)
 }
 fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
-    // Pre-allocate enough space so we NEVER reallocate during the loop.
-    // Assuming ~100 bytes for header and ~150 bytes for seq on average (adjust if your reads are longer)
+    
     let mut data = Vec::with_capacity(n * 250);
     let mut offsets = Vec::with_capacity(n);
 

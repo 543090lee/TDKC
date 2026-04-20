@@ -3,13 +3,12 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{BufWriter, Read};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
-
 use anyhow::{Context, Result};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use rayon::prelude::*;
-
 use crate::database::DomainBloomFilter;
 use crate::minimizer::MinimizerScanner;
+use crate::utils::init_thread_pool;
 
 #[derive(Default)]
 pub struct Fmix64Hasher(u64);
@@ -87,33 +86,13 @@ impl AtomicBloom {
 
     #[inline]
     fn insert(&self, item: u64) {
-        let (h1, h2) = self.hash_pair(item);
+        let (h1, h2) = crate::database::DomainBloomFilter::hash_pair(item);
         for i in 0..self.num_hashes {
             let bit_pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.num_bits;
             let byte_idx = (bit_pos / 8) as usize;
             let bit_mask = 1u8 << (bit_pos % 8);
             self.data[byte_idx].fetch_or(bit_mask, Ordering::Relaxed);
         }
-    }
-
-    #[inline(always)]
-    fn hash_pair(&self, item: u64) -> (u64, u64) {
-        let mut h1 = item;
-        h1 ^= h1 >> 33;
-        h1 = h1.wrapping_mul(0xff51afd7ed558ccd);
-        h1 ^= h1 >> 33;
-        h1 = h1.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h1 ^= h1 >> 33;
-
-        let mut h2 = item;
-        h2 ^= h2 >> 31;
-        h2 = h2.wrapping_mul(0x85ebca6b);
-        h2 ^= h2 >> 13;
-        h2 = h2.wrapping_mul(0xc2b2ae35);
-        h2 ^= h2 >> 16;
-        h2 |= 1;
-
-        (h1, h2)
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -132,6 +111,7 @@ impl AtomicBloom {
 pub struct BuildDomainConfig {
     pub db_prefix: String,
     pub threads: usize,
+    pub fpr: f64,
     pub bacteria: Option<String>,
     pub archaea: Option<String>,
     pub viral: Option<String>,
@@ -145,20 +125,10 @@ struct DomainTask {
 }
 
 pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(config.threads)
-        .build_global()
-        .ok();
+    init_thread_pool(config.threads);
 
     let total_start = Instant::now();
-
-    eprintln!("Step 1: Reading Scanner Parameters from Target DB...");
     let (k, l, spaced_seed_mask, toggle_mask) = load_db_meta(&config.db_prefix)?;
-    eprintln!(
-        "  k={}, l={}, spaced_mask={:016x}, toggle_mask={:016x}",
-        k, l, spaced_seed_mask, toggle_mask
-    );
-
     let scanner = MinimizerScanner::new(k, l, spaced_seed_mask, toggle_mask);
 
     let mut tasks = Vec::new();
@@ -168,38 +138,33 @@ pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
     if let Some(path) = config.fungi { tasks.push(DomainTask { name: "Fungi".into(), fasta_path: path, output_ext: "fungi.bloom".into() }); }
 
     if tasks.is_empty() {
-        eprintln!("No domains specified to build. Exiting.");
+        eprintln!("No domains specified.");
         return Ok(());
     }
 
     for task in tasks {
-        build_single_domain(&task, &scanner, &config.db_prefix)?;
+        build_single_domain(&task, &scanner, &config.db_prefix, config.fpr)?;
     }
 
     eprintln!(
-        "\nAll Domain Filters Built! Total time: {:.2}s",
+        "\nDone. It took {:.2}s",
         total_start.elapsed().as_secs_f64()
     );
-
     Ok(())
 }
 
-fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix: &str) -> Result<()> {
-    let start = Instant::now();
-    eprintln!("\n========================================");
+fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix: &str, fpr: f64) -> Result<()> {
     eprintln!("Processing Domain: {}", task.name);
-
     let (unique_count, total_seqs) = estimate_unique_minimizers(&task.fasta_path, scanner)?;
 
     if unique_count == 0 {
-        eprintln!("  WARNING: No valid minimizers found. Skipping.");
+        eprintln!("  WARNING: No valid minimizers found.");
         return Ok(());
     }
 
-    eprintln!("\nPass 2: Building Bloom filter with lock-free parallel insertion...");
+    eprintln!("\nBuilding BF with FPR of {} ...", fpr);
 
-    let bloom = AtomicBloom::new(unique_count, 0.01);
-
+    let bloom = AtomicBloom::new(unique_count, fpr);
     let bloom_ref = &bloom;
     let (seq_tx, seq_rx) = crossbeam_channel::bounded::<Vec<Vec<u8>>>(16);
     let fasta_path = task.fasta_path.clone();
@@ -210,23 +175,12 @@ fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix:
 
         let mut batch = Vec::with_capacity(1000);
         let mut batch_bytes = 0usize;
-        let mut current_seq = 0u64;
-        let pass2_start = Instant::now();
 
         while let Some(record) = reader.next() {
             let rec = record.map_err(|e| anyhow::anyhow!("FASTA error: {}", e))?;
             let seq = rec.seq().into_owned();
             batch_bytes += seq.len();
             batch.push(seq);
-            current_seq += 1;
-
-            if current_seq % 100_000 == 0 {
-                let pct = (current_seq as f64 / total_seqs as f64) * 100.0;
-                let elapsed = pass2_start.elapsed().as_secs_f64();
-                let rate = current_seq as f64 / elapsed;
-                eprint!("\r  [Pass 2] Progress: {} / {} seqs ({:.1}%) | {:.0} seqs/sec   ", current_seq, total_seqs, pct, rate);
-            }
-
             if batch_bytes >= 8 * 1024 * 1024 {
                 if seq_tx.send(std::mem::replace(&mut batch, Vec::with_capacity(1000))).is_err() { break; }
                 batch_bytes = 0;
@@ -262,39 +216,21 @@ fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix:
     }
 
     let inserted = total_inserted.load(Ordering::Relaxed);
-    eprintln!("  Inserted {} total minimizers (including duplicates, which are free for Bloom).", inserted);
+    eprintln!("  Inserted {} total minimizers (including duplicates).", inserted);
 
     let num_hashes = bloom.num_hashes();
     let num_bits = bloom.num_bits();
     let domain_filter = DomainBloomFilter::new(bloom.into_bytes(), num_hashes, num_bits);
-
-    let popcount = domain_filter.popcount();
-    let fill_ratio = popcount as f64 / domain_filter.num_bits as f64;
-    let est_fpr = domain_filter.estimated_fpr();
-    eprintln!(
-        "  Bloom stats: {}/{} bits set ({:.1}% fill), estimated FPR: {:.4}%",
-        popcount, domain_filter.num_bits, fill_ratio * 100.0, est_fpr * 100.0
-    );
-
     let out_path = format!("{}.{}", db_prefix, task.output_ext);
-    eprintln!("Saving domain filter to {}...", out_path);
 
     let f = File::create(&out_path)?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, f);
     bincode::serialize_into(&mut writer, &domain_filter)?;
-
-    let file_size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!(
-        "  Saved {} ({:.2} GiB) in {:.2}s",
-        out_path, file_size as f64 / 1_073_741_824.0, start.elapsed().as_secs_f64()
-    );
-
     Ok(())
 }
 
 fn estimate_unique_minimizers(fasta_path: &str, scanner: &MinimizerScanner) -> Result<(usize, u64)> {
-    eprintln!("Pass 1: Estimating unique minimizers with HyperLogLog++...");
-    let start = Instant::now();
+    eprintln!("Estimating cardinality with HLL++...");
     let (seq_tx, seq_rx) = crossbeam_channel::bounded::<Vec<Vec<u8>>>(32);
     let fasta_path_owned = fasta_path.to_string();
 
@@ -352,10 +288,6 @@ fn estimate_unique_minimizers(fasta_path: &str, scanner: &MinimizerScanner) -> R
     };
 
     let unique_count = master_hll.count().round() as usize;
-
-    eprintln!("\n  Pass 1 Complete: {} sequences scanned in {:.2}s", seq_count, start.elapsed().as_secs_f64());
-    eprintln!("  Estimated Unique Minimizers: {}", unique_count);
-
     Ok((unique_count, seq_count))
 }
 

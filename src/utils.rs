@@ -1,5 +1,4 @@
-
-// being used for dequue algorithm for minimizer
+// Being used for dequue algorithm for minimizer
 pub struct RingDeque {
     vals: [(u64, u32); 64],
     head: u32,
@@ -55,4 +54,17 @@ impl RingDeque {
         self.vals[idx as usize] = val;
         self.len += 1;
     }
+}
+
+#[inline(always)]
+pub fn extract_accession(id_bytes: &[u8]) -> &str {
+    let id_full = std::str::from_utf8(id_bytes).unwrap_or("");
+    id_full.split_whitespace().next().unwrap_or("")
+}
+
+pub fn init_thread_pool(threads: usize) {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .ok();
 }

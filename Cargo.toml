@@ -1,5 +1,5 @@
 [package]
-name = "kmer-db"
+name = "tdkc"
 version = "0.1.0"
 edition = "2021"
 description = "Target Distilled K-mer Classifier"

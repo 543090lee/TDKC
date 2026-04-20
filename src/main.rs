@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "tdkc")]
-#[command(about = "TDKC (Target Distilled K-mer Classifier) - Fast and Memory-Efficient Metagenomic Classification for Target Pathogen Diagnostics")]
+#[command(about = "TDKC (Target Distilled K-mer Classifier) - Ultrafast and Memory-Efficient Metagenomic Classification for Target Pathogen Diagnostics")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +24,6 @@ enum Commands {
     Prep {
         #[arg(short = 'f', long)]
         fasta: String,
-
 
         #[arg(short = 'x', long, num_args = 1.., required = true)]
         accession2taxid: Vec<String>,
@@ -97,29 +96,25 @@ enum Commands {
         background: bool,
     },
 
-    /// Build optional probabilistic Bloom filters for background domains.
     BuildDomain {
-        /// Prefix of the target database (used ONLY to read k/l parameters from the .meta file)
         #[arg(short = 'd', long)]
         db: String,
 
-        /// Number of threads
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
-        /// FASTA file for Bacteria
+        #[arg(short = 'p', long, default_value_t = 0.01)]
+        fpr: f64,
+
         #[arg(long)]
         bacteria: Option<String>,
 
-        /// FASTA file for Archaea
         #[arg(long)]
         archaea: Option<String>,
 
-        /// FASTA file for Viral/Plasmids
         #[arg(long)]
         viral: Option<String>,
 
-        /// FASTA file for Fungi
         #[arg(long)]
         fungi: Option<String>,
     },
@@ -196,6 +191,7 @@ fn main() -> anyhow::Result<()> {
         Commands::BuildDomain {
             db,
             threads,
+            fpr, 
             bacteria,
             archaea,
             viral,
@@ -204,6 +200,7 @@ fn main() -> anyhow::Result<()> {
             build_domain::run_build_domain(build_domain::BuildDomainConfig {
                 db_prefix: db,
                 threads,
+                fpr, 
                 bacteria,
                 archaea,
                 viral,

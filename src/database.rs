@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-
 use anyhow::{Context, Result};
 use boomphf::Mphf;
 use rustc_hash::FxHashMap;
+use crate::taxonomy::{TAXID_CELLULAR, TAXID_ROOT, TAXID_VIRAL};
 
 #[inline]
 pub fn compute_fingerprint(mut kmer: u64) -> u16 {
@@ -124,7 +124,6 @@ impl AccessionRegistry {
         w.flush().map_err(Into::into)
     }
 
-    /// Load only id→name (skips name→id map; used during query).
     pub fn load_for_query(path: &str) -> Result<Self> {
         let mut id_to_name = Vec::new();
 
@@ -143,27 +142,15 @@ impl AccessionRegistry {
     }
 }
 
-/// Uses a bitset to mark which MPHF indices have accessions, a precomputed
-/// rank table to map sparse index → dense position, and a dense array of
-/// class IDs. This replaces the old FxHashMap approach and saves hundreds of
-/// MB of RAM for large databases 
-/// Number of bits per rank block. One cached rank entry per this many bits.
 const RANK_BLOCK_BITS: usize = 512;
-const RANK_BLOCK_WORDS: usize = RANK_BLOCK_BITS / 64; // 8 u64 words per block
+const RANK_BLOCK_WORDS: usize = RANK_BLOCK_BITS / 64; 
 
 pub struct EqClassAccessions {
-    /// Bitset: 1 bit per MPHF index. Set if that index has accessions.
     bitset: Vec<u64>,
-    /// Precomputed popcount prefix sums. rank_cache[i] = number of set bits
-    /// in bitset[0 .. i*RANK_BLOCK_WORDS].
     rank_cache: Vec<u32>,
-    /// Dense class IDs: only entries whose bit is set get a slot here.
     dense_ids: Vec<u32>,
-    /// Total number of MPHF slots (needed for sizing on save).
     num_slots: usize,
-    /// Byte offsets into blob for each class.
     offsets: Vec<u32>,
-    /// VByte-encoded accession lists, one per class.
     blob: Vec<u8>,
     pub num_classes: usize,
 }
@@ -171,11 +158,10 @@ pub struct EqClassAccessions {
 impl EqClassAccessions {
     pub fn new_empty(num_slots: usize) -> Self {
         let num_words = (num_slots + 63) / 64;
-        // Class 0 = "no accessions" (implicit for any index not in the set)
         let encoded_empty = delta_vbyte_encode(&[]);
         Self {
             bitset: vec![0u64; num_words],
-            rank_cache: Vec::new(), // built at finalize
+            rank_cache: Vec::new(),
             dense_ids: Vec::new(),
             num_slots,
             offsets: vec![0u32],
@@ -184,8 +170,6 @@ impl EqClassAccessions {
         }
     }
 
-    /// Build the rank_cache from the bitset. Must be called after all
-    /// add_accessions() calls, before any get queries.
     fn build_rank_cache(&mut self) {
         let num_blocks = (self.bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
         self.rank_cache = Vec::with_capacity(num_blocks + 1);
@@ -198,10 +182,9 @@ impl EqClassAccessions {
                 cumulative += self.bitset[w].count_ones();
             }
         }
-        self.rank_cache.push(cumulative); // sentinel
+        self.rank_cache.push(cumulative);
     }
 
-    /// Compute rank(idx): number of set bits before position `idx`.
     #[inline]
     fn rank(&self, idx: usize) -> usize {
         let word = idx / 64;
@@ -218,7 +201,6 @@ impl EqClassAccessions {
         r
     }
 
-    /// Check if bit is set at position idx.
     #[inline]
     fn has_bit(&self, idx: usize) -> bool {
         let word = idx / 64;
@@ -229,7 +211,6 @@ impl EqClassAccessions {
         self.bitset[word] & (1u64 << bit) != 0
     }
 
-    /// Set bit at position idx.
     #[inline]
     fn set_bit(&mut self, idx: usize) {
         let word = idx / 64;
@@ -237,7 +218,6 @@ impl EqClassAccessions {
         self.bitset[word] |= 1u64 << bit;
     }
 
-    /// Returns true if the stored class matches `acc_list` exactly.
     fn matches(&self, class_id: u32, acc_list: &[u32]) -> bool {
         let mut pos = self.offsets[class_id as usize] as usize;
         let count = vbyte_decode(&self.blob, &mut pos) as usize;
@@ -255,18 +235,12 @@ impl EqClassAccessions {
         true
     }
 
-    /// During build: record accessions for MPHF index idx
-    /// Bits are set immediately; dense_ids is built via finalize_for_save
-    ///
-    /// During build we temporarily store class IDs in a side hashmap keyed by
-    /// idx, then pack them into dense_ids in finalize_for_save
-    /// We use a temporary FxHashMap<u32, u32> (idx -> class_id) during build
-    /// only, which is dropped before save.
     pub fn add_accessions(
         &mut self,
         idx: usize,
         acc_list: &[u32],
         hash_to_class: &mut FxHashMap<u64, u32>,
+        // This build map is temp and will be dropped before save. This is just for fast look up
         build_map: &mut FxHashMap<u32, u32>,
     ) {
         if acc_list.is_empty() {
@@ -280,7 +254,7 @@ impl EqClassAccessions {
                     if self.matches(id, acc_list) {
                         break id;
                     }
-                    // Hash collision — linear probe
+                    // Hash collision... linear probe
                     h = h.wrapping_add(0x9E3779B97F4A7C15);
                 }
                 None => {
@@ -298,15 +272,10 @@ impl EqClassAccessions {
         build_map.insert(idx as u32, class_id);
     }
 
-    /// After all add_accessions calls: pack the temporary build_map into the
-    /// dense_ids array ordered by bitset position, then build the rank cache.
-    /// The build_map is consumed (dropped) to free memory.
     pub fn finalize_for_save(&mut self, build_map: FxHashMap<u32, u32>) {
-        // Count set bits to size dense_ids
         let total_set: usize = self.bitset.iter().map(|w| w.count_ones() as usize).sum();
         self.dense_ids = vec![0u32; total_set];
 
-        // Walk bitset in order, assign dense positions
         let mut dense_pos = 0usize;
         for word_idx in 0..self.bitset.len() {
             let mut word = self.bitset[word_idx];
@@ -317,15 +286,14 @@ impl EqClassAccessions {
                     self.dense_ids[dense_pos] = class_id;
                 }
                 dense_pos += 1;
-                word &= word - 1; // clear lowest set bit
+                word &= word - 1;
             }
         }
 
         self.build_rank_cache();
     }
 
-    /// Look up the equivalence class ID for a given MPHF index.
-    /// Returns None if this minimizer has no accessions.
+    // input MPHF index and looks up the eqclass ID, and none if no minimizer
     #[inline]
     pub fn get_class_id(&self, idx: usize) -> Option<u32> {
         if !self.has_bit(idx) {
@@ -335,7 +303,7 @@ impl EqClassAccessions {
         Some(self.dense_ids[dense_pos])
     }
 
-    /// Decode the accession IDs for a given class ID.
+    // this is class ID to actual accession IDs
     pub fn decode_class(&self, class_id: u32) -> Vec<u32> {
         let cid = class_id as usize;
         if cid == 0 || cid >= self.num_classes {
@@ -347,8 +315,6 @@ impl EqClassAccessions {
 
     pub fn save(&self, path: &str) -> Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
-
-        // Header
         let num_entries = self.dense_ids.len() as u64;
         let num_classes = self.num_classes as u64;
         let num_slots = self.num_slots as u64;
@@ -356,11 +322,9 @@ impl EqClassAccessions {
         w.write_all(&num_classes.to_le_bytes())?;
         w.write_all(&num_slots.to_le_bytes())?;
 
-        // Choose narrowest width for class IDs
         let width: u8 = if num_classes <= 256 { 1 } else if num_classes <= 65536 { 2 } else { 4 };
         w.write_all(&[width])?;
 
-        // Bitset (raw u64 words)
         let num_words = self.bitset.len() as u64;
         w.write_all(&num_words.to_le_bytes())?;
         let bitset_bytes = unsafe {
@@ -371,7 +335,6 @@ impl EqClassAccessions {
         };
         w.write_all(bitset_bytes)?;
 
-        // Dense class IDs at chosen width
         match width {
             1 => w.write_all(&self.dense_ids.iter().map(|&c| c as u8).collect::<Vec<_>>())?,
             2 => {
@@ -390,22 +353,18 @@ impl EqClassAccessions {
             }
         }
 
-        // Blob
         w.write_all(&(self.blob.len() as u64).to_le_bytes())?;
         w.write_all(&self.blob)?;
         w.flush().map_err(Into::into)
     }
 
-    // ─── Load (v2 format) ───────────────────────────────────────────────────
-
     pub fn load(path: &str) -> Result<Self> {
         let mut f = BufReader::new(
-            File::open(path).context("Cannot open equivalence class accession file")?
+            File::open(path).context("Cant open eq class accession file")?
         );
         let mut buf8 = [0u8; 8];
         let mut buf1 = [0u8; 1];
 
-        // Header
         f.read_exact(&mut buf8)?;
         let num_entries = u64::from_le_bytes(buf8) as usize;
         f.read_exact(&mut buf8)?;
@@ -415,7 +374,6 @@ impl EqClassAccessions {
         f.read_exact(&mut buf1)?;
         let width = buf1[0];
 
-        // Bitset
         f.read_exact(&mut buf8)?;
         let num_words = u64::from_le_bytes(buf8) as usize;
         let mut bitset = vec![0u64; num_words];
@@ -427,7 +385,6 @@ impl EqClassAccessions {
         };
         f.read_exact(bitset_bytes)?;
 
-        // Dense class IDs
         let dense_ids: Vec<u32> = match width {
             1 => {
                 let mut bytes = vec![0u8; num_entries];
@@ -455,13 +412,11 @@ impl EqClassAccessions {
             _ => anyhow::bail!("Invalid class_id width: {}", width),
         };
 
-        // Blob
         f.read_exact(&mut buf8)?;
         let blob_len = u64::from_le_bytes(buf8) as usize;
         let mut blob = vec![0u8; blob_len];
         f.read_exact(&mut blob)?;
 
-        // Rebuild offset table by walking blob
         let mut offsets = Vec::with_capacity(num_classes);
         let mut bpos: usize = 0;
         for _ in 0..num_classes {
@@ -469,7 +424,6 @@ impl EqClassAccessions {
             delta_vbyte_skip(&blob, &mut bpos);
         }
 
-        // Build rank cache
         let num_blocks = (bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
         let mut rank_cache = Vec::with_capacity(num_blocks + 1);
         let mut cumulative: u32 = 0;
@@ -495,7 +449,6 @@ impl EqClassAccessions {
     }
 }
 
-// ─── KmerDatabase ────────────────────────────────────────────────────────────
 
 pub struct KmerDatabase {
     pub k: usize,
@@ -511,10 +464,9 @@ pub struct KmerDatabase {
     accessions: Option<EqClassAccessions>,
 }
 
-
 impl KmerDatabase {
-    /// Direct constructor — used by build.rs to create the DB without
-    /// going through an intermediate MinimizerEntry representation.
+
+    // This is called by build.rs 
     pub fn new(
         k: usize,
         l: usize,
@@ -551,7 +503,6 @@ impl KmerDatabase {
         self.ancestor_matrix[a * n + d] != 0
     }
 
-    /// Decode accession IDs from a class ID. Call only when you need the names.
     pub fn resolve_accessions(&self, class_id: u32) -> Vec<u32> {
         match self.accessions {
             Some(ref acc) => acc.decode_class(class_id),
@@ -600,7 +551,6 @@ impl KmerDatabase {
                     bg_taxid: 0,
                 });
             } else {
-                // --- NEW BACKGROUND LCA LOGIC ---
                 let mut match_count = 0;
                 let mut last_hit_taxid = 0;
                 let mut hit_viral = false;
@@ -611,9 +561,11 @@ impl KmerDatabase {
                         match_count += 1;
                         last_hit_taxid = *t_id;
                         
-                        if *t_id == 10239 { // Viruses
+                        // here, 10239 - Viruses, 2 - Bacteria, 2157 - Archaea, 4751 - Fungi.
+                        // Domains, these are just hardcoded in
+                        if *t_id == TAXID_VIRAL {
                             hit_viral = true;
-                        } else { // Bacteria (2), Archaea (2157), Fungi (4751)
+                        } else {
                             hit_cellular = true;
                         }
                     }
@@ -621,16 +573,18 @@ impl KmerDatabase {
 
                 let bg_taxid = match match_count {
                     0 => 0,
-                    1 => last_hit_taxid, // Exact match to a single domain
+                    1 => last_hit_taxid,
                     _ => {
+                        // 1 is root, and it goes up when k-mer hits viruses and cellular
+                        // remmeber, viruses is non living, so LCA root makes sense
                         if hit_viral && hit_cellular {
-                            1 // Root: LCA of Viruses + Cellular
+                            TAXID_ROOT
                         } else {
-                            131567 // Cellular organisms: LCA of Bacteria, Archaea, Fungi
+                            // this is cellular organisms - LCA of bacteria, archaea, fungi
+                            TAXID_CELLULAR
                         }
                     }
                 };
-
                 out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid });
             }
         }
@@ -665,13 +619,13 @@ impl KmerDatabase {
             w.write_all(fp_bytes)?;
             w.flush()?;
         }
-        // .taxid  (u8 per minimizer)
+        // .taxid - this is in u8 btw
         {
             let mut w = BufWriter::new(File::create(format!("{}.taxid", prefix))?);
             w.write_all(&self.taxid_indices)?;
             w.flush()?;
         }
-        // .taxmap  (binary)
+        // .taxmap - binary
         {
             let mut w = BufWriter::new(File::create(format!("{}.taxmap", prefix))?);
             w.write_all(&(self.index_to_taxid.len() as u64).to_le_bytes())?;
@@ -685,15 +639,7 @@ impl KmerDatabase {
             w.write_all(&self.ancestor_matrix)?;
             w.flush()?;
         }
-        // .taxmap.txt  (human-readable)
-        {
-            let mut w = BufWriter::new(File::create(format!("{}.taxmap.txt", prefix))?);
-            writeln!(w, "Index\tActual_TaxID")?;
-            for (i, &t) in self.index_to_taxid.iter().enumerate() {
-                writeln!(w, "{}\t{}", i, t)?;
-            }
-            w.flush()?;
-        }
+        
         if let Some(ref acc) = self.accessions {
             acc.save(&format!("{}.accession", prefix))?;
         }
@@ -711,12 +657,12 @@ impl KmerDatabase {
             let mut buf8 = [0u8; 8];
             let mut buf1 = [0u8; 1];
 
-            f.read_exact(&mut buf4)?; let k  = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf4)?; let l  = u32::from_le_bytes(buf4) as usize;
+            f.read_exact(&mut buf4)?; let k = u32::from_le_bytes(buf4) as usize;
+            f.read_exact(&mut buf4)?; let l = u32::from_le_bytes(buf4) as usize;
             f.read_exact(&mut buf8)?; let spaced_seed_mask = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?; let toggle_mask      = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?; let num_minimizers   = u64::from_le_bytes(buf8) as usize;
-            f.read_exact(&mut buf1)?; let has_acc          = buf1[0] == 1;
+            f.read_exact(&mut buf8)?; let toggle_mask = u64::from_le_bytes(buf8);
+            f.read_exact(&mut buf8)?; let num_minimizers = u64::from_le_bytes(buf8) as usize;
+            f.read_exact(&mut buf1)?; let has_acc = buf1[0] == 1;
             (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc)
         };
 
@@ -764,7 +710,6 @@ impl KmerDatabase {
             
             let mut anc = vec![0u8; sz * sz];
             if let Err(_) = f.read_exact(&mut anc) {
-                eprintln!("  Note: No ancestor matrix found in DB (old format). Ties will not roll up.");
                 anc.fill(0);
             }
             (v, anc)
@@ -812,7 +757,7 @@ impl DomainBloomFilter {
     }
 
     #[inline(always)]
-    fn hash_pair(item: u64) -> (u64, u64) {
+    pub fn hash_pair(item: u64) -> (u64, u64) {
         let mut h1 = item;
         h1 ^= h1 >> 33;
         h1 = h1.wrapping_mul(0xff51afd7ed558ccd);
@@ -837,14 +782,10 @@ impl DomainBloomFilter {
         bincode::deserialize_from(&mut reader).map_err(Into::into)
     }
 
-    pub fn popcount(&self) -> u64 {
-        self.data.iter().map(|b| b.count_ones() as u64).sum()
-    }
-
-    pub fn estimated_fpr(&self) -> f64 {
-        let fill = self.popcount() as f64 / self.num_bits as f64;
-        fill.powf(self.num_hashes as f64)
-    }
+    // pub fn estimated_fpr(&self) -> f64 {
+    //     let fill = self.popcount() as f64 / self.num_bits as f64;
+    //     fill.powf(self.num_hashes as f64)
+    // }
 }
 
 pub struct Hit {
