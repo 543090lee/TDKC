@@ -8,7 +8,7 @@ use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
 use itertools::Itertools;
 use crate::utils::init_thread_pool;
-use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_CELLULAR, TAXID_FUNGI, TAXID_ROOT, TAXID_VIRAL};
+use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, resolve_domain_lca};
 
 pub struct QueryConfig {
     pub db_prefix: String,
@@ -31,6 +31,7 @@ pub struct ReadBatch {
     pub batch2: Option<FlatBatch>,
 }
 
+// this goes to writer thread
 struct BatchResult {
     output_data: Vec<u8>,
     report_counts: FxHashMap<u32, usize>,
@@ -43,7 +44,6 @@ struct BatchResult {
 pub fn run_query(config: QueryConfig) -> Result<()> {
     init_thread_pool(config.threads);
 
-    let db_start = std::time::Instant::now();
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
 
     let mut bg_filters = Vec::new();
@@ -87,19 +87,25 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         db.toggle_mask,
     );
 
-    let db_elapsed = db_start.elapsed();
     let is_paired = config.read2_file.is_some();
-
     if is_paired { eprintln!("Running paired-end reads"); } 
     else { eprintln!("Running single-end reads"); }
 
     let classify_start = std::time::Instant::now();
-    let output_file = File::create(format!("{}.output", config.output_prefix))?;
-    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
 
+    // thread only to write, no lock, so less overhead
+    let output_file = File::create(format!("{}.output", config.output_prefix))?;
+    // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
+    // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
+    // writer thread will act as a mutex, but without contention
     let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
+        //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
+        //when it;s full
         let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
         let mut global_report: HashMap<u32, usize> = HashMap::new();
+
+        // I could use AtomicUsize for these, since these are single values, but too lazy
         let mut total_c: usize = 0;
         let mut total_u: usize = 0;
         let mut total_a: usize = 0;
@@ -120,7 +126,11 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     });
 
     let batch_size = 5_000;
+    // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
+    // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
+    // to wait before starting on the nextc chunk (mpsc)
     let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
+    // Reader thread(s): produce batches directly (no intermediate chunks)
     let r1_path = config.read1_file.clone();
     let r2_path = config.read2_file.clone();
 
@@ -130,10 +140,12 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         } else {
             read_single_batches(&r1_path, batch_size, &batch_tx)?;
         }
+         // sender is done, so done reading (EOF)
         drop(batch_tx); 
         Ok(())
     });
 
+    //par_bridge() let's channel to give batch to rayon thread whenever it's free
     batch_rx.into_iter().par_bridge().for_each(|batch| {
         let result = classify_batch(
             &batch,
@@ -199,6 +211,8 @@ fn apply_penalty(hit_groups: usize, penalty: usize) -> usize {
     if hit_groups > penalty { hit_groups - penalty } else { 0 }
 }
 
+// Tried not to use mutex here since it was keep giving me extra lock contention overhead
+// This was the main reason I switched to having a main writer thread
 #[inline(never)]
 fn classify_batch(
     batch: &ReadBatch,
@@ -239,7 +253,7 @@ fn classify_batch(
             (0, false)
         };
 
-        let mut write_prefix = |out: &mut Vec<u8>, status: &str, taxid: &dyn std::fmt::Display| {
+        let write_prefix = |out: &mut Vec<u8>, status: &str, taxid: &dyn std::fmt::Display| {
             let header_str = unsafe { std::str::from_utf8_unchecked(&header1) };
             if is_paired {
                 let _ = write!(out, "{}\t{}\t{}\t{}|{}\t", status, header_str, taxid, seq1.len(), seq2_len);
@@ -254,14 +268,15 @@ fn classify_batch(
         let mut target_hit_groups: usize = 0;
         let mut bg_hit_groups: usize = 0;
 
-        {
+        // Inline closure to process hits without code duplication
+        let mut process_hits = |hits: &[Hit], minimizer_buf: &[u64]| {
             let mut last_minimizer: u64 = u64::MAX;
-            for (idx, hit) in hits1.iter().enumerate() {
+            for (idx, hit) in hits.iter().enumerate() {
                 if hit.is_hit {
                     valid_hits += 1;
                     taxid_counts[hit.taxid_idx as usize] += 1;
-                    if idx < minimizer_buf1.len() {
-                        let m = minimizer_buf1[idx];
+                    if idx < minimizer_buf.len() {
+                        let m = minimizer_buf[idx];
                         if m != last_minimizer {
                             target_hit_groups += 1;
                             last_minimizer = m;
@@ -270,8 +285,8 @@ fn classify_batch(
                 } else if hit.bg_taxid != 0 {
                     valid_hits += 1;
                     *bg_counts.entry(hit.bg_taxid).or_default() += 1;
-                    if idx < minimizer_buf1.len() {
-                        let m = minimizer_buf1[idx];
+                    if idx < minimizer_buf.len() {
+                        let m = minimizer_buf[idx];
                         if m != last_minimizer {
                             bg_hit_groups += 1;
                             last_minimizer = m;
@@ -279,33 +294,10 @@ fn classify_batch(
                     }
                 }
             }
-        }
-
+        };
+        process_hits(&hits1, &minimizer_buf1); // this is for r1
         if has_r2 {
-            let mut last_minimizer: u64 = u64::MAX;
-            for (idx, hit) in hits2.iter().enumerate() {
-                if hit.is_hit {
-                    valid_hits += 1;
-                    taxid_counts[hit.taxid_idx as usize] += 1;
-                    if idx < minimizer_buf2.len() {
-                        let m = minimizer_buf2[idx];
-                        if m != last_minimizer {
-                            target_hit_groups += 1;
-                            last_minimizer = m;
-                        }
-                    }
-                } else if hit.bg_taxid != 0 {
-                    valid_hits += 1;
-                    *bg_counts.entry(hit.bg_taxid).or_default() += 1;
-                    if idx < minimizer_buf2.len() {
-                        let m = minimizer_buf2[idx];
-                        if m != last_minimizer {
-                            bg_hit_groups += 1;
-                            last_minimizer = m;
-                        }
-                    }
-                }
-            }
+            process_hits(&hits2, &minimizer_buf2); // this is for r2
         }
 
         let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, 1);
@@ -418,7 +410,6 @@ fn classify_batch(
                 } else {
                     // no LCA then it's ambiguous
                     let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
-                    let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
                     write_prefix(&mut local_output, "A", &tied_taxids_str);
                     write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
                     if has_r2 {
@@ -434,18 +425,7 @@ fn classify_batch(
                 let final_bg_taxid = if best_bg_taxids.len() == 1 {
                     best_bg_taxids[0]
                 } else {
-                    let mut hit_viral = false;
-                    let mut hit_cellular = false;
-                    
-                    for &t in &best_bg_taxids {
-                        if t == TAXID_VIRAL || t == TAXID_ROOT { hit_viral = true; }
-                        if t == TAXID_BACTERIA || t == TAXID_ARCHAEA || t == TAXID_FUNGI || t == TAXID_CELLULAR { hit_cellular = true; }
-                    }
-                    
-                    if hit_viral && hit_cellular { TAXID_ROOT } 
-                    else if hit_cellular { TAXID_CELLULAR } 
-                    else if hit_viral { TAXID_VIRAL } 
-                    else { TAXID_ROOT }
+                    resolve_domain_lca(best_bg_taxids.iter())
                 };
 
                 // background classified

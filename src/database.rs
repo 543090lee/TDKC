@@ -5,84 +5,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use boomphf::Mphf;
 use rustc_hash::FxHashMap;
-use crate::taxonomy::{TAXID_CELLULAR, TAXID_ROOT, TAXID_VIRAL};
-
-#[inline]
-pub fn compute_fingerprint(mut kmer: u64) -> u16 {
-    kmer ^= kmer >> 33;
-    kmer = kmer.wrapping_mul(0xff51afd7ed558ccd);
-    kmer ^= kmer >> 33;
-    (kmer & 0xFFFF) as u16
-}
-
-#[inline]
-fn hash_slice(slice: &[u32]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    slice.hash(&mut hasher);
-    hasher.finish()
-}
-
-#[inline]
-pub fn vbyte_encode(mut val: u32, out: &mut Vec<u8>) {
-    loop {
-        if val < 0x80 {
-            out.push(val as u8);
-            return;
-        }
-        out.push((val as u8 & 0x7F) | 0x80);
-        val >>= 7;
-    }
-}
-
-#[inline]
-pub fn vbyte_decode(data: &[u8], pos: &mut usize) -> u32 {
-    let mut val: u32 = 0;
-    let mut shift = 0;
-    loop {
-        let b = data[*pos];
-        *pos += 1;
-        val |= ((b & 0x7F) as u32) << shift;
-        if b & 0x80 == 0 {
-            return val;
-        }
-        shift += 7;
-    }
-}
-
-pub fn delta_vbyte_encode(sorted_ids: &[u32]) -> Vec<u8> {
-    let mut out = Vec::new();
-    vbyte_encode(sorted_ids.len() as u32, &mut out);
-    let mut prev = 0u32;
-    for &id in sorted_ids {
-        vbyte_encode(id - prev, &mut out);
-        prev = id;
-    }
-    out
-}
-
-pub fn delta_vbyte_decode(data: &[u8], pos: &mut usize) -> Vec<u32> {
-    let count = vbyte_decode(data, pos) as usize;
-    let mut result = Vec::with_capacity(count);
-    let mut prev = 0u32;
-    for _ in 0..count {
-        let delta = vbyte_decode(data, pos);
-        prev += delta;
-        result.push(prev);
-    }
-    result
-}
-
-#[inline]
-pub fn delta_vbyte_skip(data: &[u8], pos: &mut usize) {
-    let count = vbyte_decode(data, pos) as usize;
-    for _ in 0..count {
-        while data[*pos] & 0x80 != 0 {
-            *pos += 1;
-        }
-        *pos += 1;
-    }
-}
+use crate::hash::compute_fingerprint;
+use crate::taxonomy::resolve_domain_lca;
+use crate::compression::{delta_vbyte_decode, delta_vbyte_encode, delta_vbyte_skip, vbyte_decode};
 
 pub struct AccessionRegistry {
     name_to_id: HashMap<String, u32>,
@@ -247,7 +172,7 @@ impl EqClassAccessions {
             return;
         }
 
-        let mut h = hash_slice(acc_list);
+        let mut h = crate::hash::hash_slice(acc_list);
         let class_id = loop {
             match hash_to_class.get(&h) {
                 Some(&id) => {
@@ -551,39 +476,24 @@ impl KmerDatabase {
                     bg_taxid: 0,
                 });
             } else {
+                let mut hit_taxids = [0u32; 4]; 
                 let mut match_count = 0;
-                let mut last_hit_taxid = 0;
-                let mut hit_viral = false;
-                let mut hit_cellular = false;
 
                 for (filter, t_id) in bg_filters {
                     if filter.contains(m) {
-                        match_count += 1;
-                        last_hit_taxid = *t_id;
-                        
-                        // here, 10239 - Viruses, 2 - Bacteria, 2157 - Archaea, 4751 - Fungi.
-                        // Domains, these are just hardcoded in
-                        if *t_id == TAXID_VIRAL {
-                            hit_viral = true;
-                        } else {
-                            hit_cellular = true;
+                        if match_count < 4 {
+                            hit_taxids[match_count] = *t_id;
                         }
+                        match_count += 1;
                     }
                 }
 
                 let bg_taxid = match match_count {
                     0 => 0,
-                    1 => last_hit_taxid,
-                    _ => {
-                        // 1 is root, and it goes up when k-mer hits viruses and cellular
-                        // remmeber, viruses is non living, so LCA root makes sense
-                        if hit_viral && hit_cellular {
-                            TAXID_ROOT
-                        } else {
-                            // this is cellular organisms - LCA of bacteria, archaea, fungi
-                            TAXID_CELLULAR
-                        }
-                    }
+                    1 => hit_taxids[0], 
+                    _ => resolve_domain_lca(
+                        hit_taxids[..match_count.min(4)].iter()
+                    ),
                 };
                 out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid });
             }
@@ -744,7 +654,7 @@ impl DomainBloomFilter {
 
     #[inline]
     pub fn contains(&self, item: u64) -> bool {
-        let (h1, h2) = Self::hash_pair(item);
+        let (h1, h2) = crate::hash::bloom_hash_pair(item);
         for i in 0..self.num_hashes {
             let bit_pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.num_bits;
             let byte_idx = (bit_pos / 8) as usize;
@@ -754,26 +664,6 @@ impl DomainBloomFilter {
             }
         }
         true
-    }
-
-    #[inline(always)]
-    pub fn hash_pair(item: u64) -> (u64, u64) {
-        let mut h1 = item;
-        h1 ^= h1 >> 33;
-        h1 = h1.wrapping_mul(0xff51afd7ed558ccd);
-        h1 ^= h1 >> 33;
-        h1 = h1.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h1 ^= h1 >> 33;
-
-        let mut h2 = item;
-        h2 ^= h2 >> 31;
-        h2 = h2.wrapping_mul(0x85ebca6b);
-        h2 ^= h2 >> 13;
-        h2 = h2.wrapping_mul(0xc2b2ae35);
-        h2 ^= h2 >> 16;
-        h2 |= 1;
-
-        (h1, h2)
     }
 
     pub fn load(path: &str) -> Result<Self> {

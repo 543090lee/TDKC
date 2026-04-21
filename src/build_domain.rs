@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::hash::{BuildHasher, Hasher};
 use std::io::{BufWriter, Read};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
@@ -9,44 +8,7 @@ use rayon::prelude::*;
 use crate::database::DomainBloomFilter;
 use crate::minimizer::MinimizerScanner;
 use crate::utils::init_thread_pool;
-
-#[derive(Default)]
-pub struct Fmix64Hasher(u64);
-
-impl Hasher for Fmix64Hasher {
-    #[inline(always)]
-    fn write_u64(&mut self, i: u64) {
-        let mut k = i;
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xff51afd7ed558ccd);
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
-        k ^= k >> 33;
-        self.0 = k;
-    }
-
-    #[inline(always)]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(&bytes[..8]);
-        self.write_u64(u64::from_ne_bytes(arr));
-    }
-
-    #[inline(always)]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct BuildFmix64Hasher;
-
-impl BuildHasher for BuildFmix64Hasher {
-    type Hasher = Fmix64Hasher;
-    fn build_hasher(&self) -> Self::Hasher {
-        Fmix64Hasher::default()
-    }
-}
+use crate::hash::{BuildFmix64Hasher,bloom_hash_pair};
 
 struct AtomicBloom {
     data: Vec<AtomicU8>,
@@ -86,7 +48,7 @@ impl AtomicBloom {
 
     #[inline]
     fn insert(&self, item: u64) {
-        let (h1, h2) = crate::database::DomainBloomFilter::hash_pair(item);
+        let (h1, h2) = bloom_hash_pair(item);
         for i in 0..self.num_hashes {
             let bit_pos = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.num_bits;
             let byte_idx = (bit_pos / 8) as usize;

@@ -6,7 +6,8 @@ mod query;
 mod taxonomy;
 mod utils;
 mod build_domain;
-
+mod compression;
+mod hash;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]

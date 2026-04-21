@@ -1,4 +1,3 @@
-use crate::utils::RingDeque;
 const INVALID: u8 = 0xFF;
 const BASE_LUT: [u8; 256] = {
     let mut lut = [INVALID; 256];
@@ -143,4 +142,61 @@ pub fn create_spaced_seed_mask(pattern: &str) -> u64 {
         }
     }
     mask
+}
+
+struct RingDeque {
+    vals: [(u64, u32); 64],
+    head: u32,
+    len: u32,
+}
+
+impl RingDeque {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            vals: [(0u64, 0u32); 64],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn back(&self) -> (u64, u32) {
+        let idx = (self.head + self.len - 1) & 63;
+        self.vals[idx as usize]
+    }
+
+    #[inline(always)]
+    fn front(&self) -> (u64, u32) {
+        self.vals[self.head as usize]
+    }
+
+    #[inline(always)]
+    fn pop_back(&mut self) {
+        self.len -= 1;
+    }
+
+    #[inline(always)]
+    fn pop_front(&mut self) {
+        self.head = (self.head + 1) & 63;
+        self.len -= 1;
+    }
+
+    #[inline(always)]
+    fn push_back(&mut self, val: (u64, u32)) {
+        let idx = (self.head + self.len) & 63;
+        self.vals[idx as usize] = val;
+        self.len += 1;
+    }
 }

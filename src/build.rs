@@ -5,11 +5,12 @@ use anyhow::Result;
 use boomphf::Mphf;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use crate::database::{AccessionRegistry, EqClassAccessions, KmerDatabase,compute_fingerprint};
+use crate::database::{AccessionRegistry, EqClassAccessions, KmerDatabase};
 use crate::minimizer::{create_spaced_seed_mask, MinimizerScanner, SPACED_PATTERN, TOGGLE_MASK};
 use crate::prep::load_prelim_map;
 use crate::taxonomy::{load_target_taxids, BfsTaxonomy, TargetTaxIDManager, TaxonomyTree};
-use crate::utils::init_thread_pool;
+use crate::utils::{init_thread_pool,segment_ranges};
+use crate::hash::compute_fingerprint;
 
 pub struct BuildConfig {
     pub fasta_file: String,
@@ -440,28 +441,6 @@ struct AccRecord {
     acc_name: String,
 }
 
-fn segment_ranges(seq_len: usize, k: usize) -> Vec<(usize, usize)> {
-    if seq_len <= SEG_TARGET_LEN {
-        return vec![(0, seq_len)];
-    }
-
-    let overlap = k.saturating_sub(1);
-    let stride = SEG_TARGET_LEN - overlap;
-    let mut ranges = Vec::new();
-    let mut start = 0;
-
-    while start < seq_len {
-        let end = (start + SEG_TARGET_LEN).min(seq_len);
-        ranges.push((start, end));
-        if end == seq_len {
-            break;
-        }
-        start += stride;
-    }
-
-    ranges
-}
-
 fn extract_target_minimizers(
     target_fasta_path: &str,
     target_accessions: &HashSet<String>,
@@ -510,7 +489,7 @@ fn extract_target_minimizers(
                 }
             }
 
-            let ranges = segment_ranges(seq_len, k);
+            let ranges = segment_ranges(seq_len, k, SEG_TARGET_LEN);
 
             for (start, end) in ranges {
                 batch_bytes += end - start;
@@ -649,7 +628,7 @@ fn collect_background_hits(
 
             let seq_data = Arc::new(rec.seq().into_owned());
             let seq_len = seq_data.len();
-            let ranges = segment_ranges(seq_len, k);
+            let ranges = segment_ranges(seq_len, k, SEG_TARGET_LEN);
             for (start, end) in ranges {
                 batch_bytes += end - start;
                 work_items.push(ChallengeSegment {

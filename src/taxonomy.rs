@@ -3,10 +3,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use anyhow::{Context, Result};
 
+
 pub const TAXID_VIRAL: u32 = 10239;
 pub const TAXID_BACTERIA: u32 = 2;
 pub const TAXID_ARCHAEA: u32 = 2157;
 pub const TAXID_FUNGI: u32 = 4751;
+
+// 1 is root, and it goes up when k-mer hits viruses and cellular
+// remmeber, viruses is non living, so LCA root makes sense
 pub const TAXID_CELLULAR: u32 = 131567;
 pub const TAXID_ROOT: u32 = 1;
 
@@ -208,4 +212,24 @@ pub fn load_target_taxids(path: &str) -> Result<HashSet<u32>> {
     }
     eprintln!("Loaded {} target taxids", targets.len());
     Ok(targets)
+}
+
+#[inline]
+pub fn resolve_domain_lca<'a>(taxids: impl Iterator<Item = &'a u32>) -> u32 {
+    let mut hit_viral = false;
+    let mut hit_cellular = false;
+
+    for &t in taxids {
+        if t == TAXID_VIRAL || t == TAXID_ROOT { 
+            hit_viral = true; 
+        }
+        if t == TAXID_BACTERIA || t == TAXID_ARCHAEA || t == TAXID_FUNGI || t == TAXID_CELLULAR { 
+            hit_cellular = true; 
+        }
+    }
+
+    if hit_viral && hit_cellular { TAXID_ROOT } 
+    else if hit_cellular { TAXID_CELLULAR } 
+    else if hit_viral { TAXID_VIRAL } 
+    else { TAXID_ROOT }
 }
