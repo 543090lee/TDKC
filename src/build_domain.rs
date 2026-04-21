@@ -30,14 +30,7 @@ impl AtomicBloom {
             data.push(AtomicU8::new(0));
         }
 
-        eprintln!(
-            "  AtomicBloom: {} bits ({:.2} GiB), {} hashes for {} items @ {:.1}% FPR",
-            m,
-            num_bytes as f64 / 1_073_741_824.0,
-            k,
-            expected_items,
-            fpr * 100.0
-        );
+        eprintln!("{} bits ({:.2} GiB), {} hashes for {} items @ {:.1}% FPR", m, num_bytes as f64 / 1_073_741_824.0, k, expected_items, fpr * 100.0);
 
         Self {
             data,
@@ -120,7 +113,7 @@ fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix:
     let (unique_count, total_seqs) = estimate_unique_minimizers(&task.fasta_path, scanner)?;
 
     if unique_count == 0 {
-        eprintln!("  WARNING: No valid minimizers found.");
+        eprintln!("WARNING: No valid minimizers found.");
         return Ok(());
     }
 
@@ -178,7 +171,7 @@ fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix:
     }
 
     let inserted = total_inserted.load(Ordering::Relaxed);
-    eprintln!("  Inserted {} total minimizers (including duplicates).", inserted);
+    eprintln!("Inserted {} total minimizers (including duplicates).", inserted);
 
     let num_hashes = bloom.num_hashes();
     let num_bits = bloom.num_bits();

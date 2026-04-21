@@ -9,11 +9,11 @@ use rustc_hash::FxHashMap;
 use itertools::Itertools;
 use crate::utils::init_thread_pool;
 use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, resolve_domain_lca};
+use crate::read_finder::Sample;
 
 pub struct QueryConfig {
     pub db_prefix: String,
-    pub read1_file: String,
-    pub read2_file: Option<String>,
+    pub samples: Vec<Sample>,
     pub threads: usize,
     pub use_accessions: bool,
     pub background: bool,
@@ -80,129 +80,129 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         None
     };
 
-    let scanner = MinimizerScanner::new(
-        db.k(),
-        db.l(),
-        db.spaced_seed_mask,
-        db.toggle_mask,
-    );
-
-    let is_paired = config.read2_file.is_some();
-    if is_paired { eprintln!("Running paired-end reads"); } 
-    else { eprintln!("Running single-end reads"); }
-
+    let scanner = MinimizerScanner::new(db.k(),db.l(),db.spaced_seed_mask,db.toggle_mask);
     let classify_start = std::time::Instant::now();
+    let num_samples = config.samples.len();
 
-    // thread only to write, no lock, so less overhead
-    let output_file = File::create(format!("{}.output", config.output_prefix))?;
-    // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
-    // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
-    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
-    // writer thread will act as a mutex, but without contention
-    let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
-        //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
-        //when it;s full
-        let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
-        let mut global_report: HashMap<u32, usize> = HashMap::new();
-
-        // I could use AtomicUsize for these, since these are single values, but too lazy
-        let mut total_c: usize = 0;
-        let mut total_u: usize = 0;
-        let mut total_a: usize = 0;
-        let mut total_n: usize = 0;
-
-        for batch in writer_rx {
-            writer.write_all(&batch.output_data)?;
-            for (taxid, count) in batch.report_counts {
-                *global_report.entry(taxid).or_default() += count;
-            }
-            total_c += batch.classified;
-            total_u += batch.unclassified;
-            total_a += batch.ambiguous;
-            total_n += batch.num_records;
-        }
-        writer.flush()?;
-        Ok((global_report, total_c, total_u, total_a, total_n))
-    });
-
-    let batch_size = 5_000;
-    // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
-    // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
-    // to wait before starting on the nextc chunk (mpsc)
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
-    // Reader thread(s): produce batches directly (no intermediate chunks)
-    let r1_path = config.read1_file.clone();
-    let r2_path = config.read2_file.clone();
-
-    let reader_handle = std::thread::spawn(move || -> Result<()> {
-        if let Some(ref r2_path_str) = r2_path {
-            read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx)?;
+    // Takes in either single FASTQ file or a dir of FASTQ files
+    for sample in config.samples {
+        let is_paired = sample.r2.is_some();
+        let r1_path = sample.r1.to_string_lossy().to_string();
+        let r2_path = sample.r2.as_ref().map(|p| p.to_string_lossy().to_string());   
+        
+        eprint!("\n>>> Processing sample ");
+        let out_prefix = if num_samples == 1 && !std::path::Path::new(&config.output_prefix).is_dir() {
+            eprint!("...");
+            config.output_prefix.clone()
         } else {
-            read_single_batches(&r1_path, batch_size, &batch_tx)?;
+            eprint!("{}", sample.name);
+            format!("{}/{}", config.output_prefix, sample.name)
+        };
+
+        eprintln!();
+        // thread only to write, no lock, so less overhead
+        let output_file = File::create(format!("{}.output", out_prefix))?;
+        // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
+        // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
+        // writer thread will act as a mutex, but without contention
+        let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
+            //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
+            //when it;s full
+            let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
+            let mut global_report: HashMap<u32, usize> = HashMap::new();
+
+            // I could use AtomicUsize for these, since these are single values, but too lazy
+            let mut total_c: usize = 0;
+            let mut total_u: usize = 0;
+            let mut total_a: usize = 0;
+            let mut total_n: usize = 0;
+
+            for batch in writer_rx {
+                writer.write_all(&batch.output_data)?;
+                for (taxid, count) in batch.report_counts {
+                    *global_report.entry(taxid).or_default() += count;
+                }
+                total_c += batch.classified;
+                total_u += batch.unclassified;
+                total_a += batch.ambiguous;
+                total_n += batch.num_records;
+            }
+            writer.flush()?;
+            Ok((global_report, total_c, total_u, total_a, total_n))
+        });
+
+        let batch_size = 5_000;
+        // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
+        // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
+        // to wait before starting on the nextc chunk (mpsc)
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
+
+        let reader_handle = std::thread::spawn(move || -> Result<()> {
+            if let Some(ref r2_path_str) = r2_path {
+                read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx)?;
+            } else {
+                read_single_batches(&r1_path, batch_size, &batch_tx)?;
+            }
+            // sender is done, so done reading (EOF)
+            drop(batch_tx); 
+            Ok(())
+        });
+
+        //par_bridge() let's channel to give batch to rayon thread whenever it's free
+        batch_rx.into_iter().par_bridge().for_each(|batch| {
+            let result = classify_batch(
+                &batch,
+                &db,
+                &scanner,
+                &acc_registry,
+                config.minimum_hit_groups,
+                is_paired,
+                &bg_filters,
+            );
+            let _ = writer_tx.send(result);
+        });
+
+        drop(writer_tx);
+        let (global_report, c, u, a, num_records) = match writer_handle.join() {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("Writer thread panicked"),
+        };
+
+        match reader_handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("Reader thread panicked"),
         }
-         // sender is done, so done reading (EOF)
-        drop(batch_tx); 
-        Ok(())
-    });
 
-    //par_bridge() let's channel to give batch to rayon thread whenever it's free
-    batch_rx.into_iter().par_bridge().for_each(|batch| {
-        let result = classify_batch(
-            &batch,
-            &db,
-            &scanner,
-            &acc_registry,
-            config.minimum_hit_groups,
-            is_paired,
-            &bg_filters,
-        );
-        let _ = writer_tx.send(result);
-    });
+        {
+            let f = File::create(format!("{}.report", out_prefix))?;
+            let mut writer = io::BufWriter::new(f);
+            let mut sorted: Vec<(u32, usize)> = global_report.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-    drop(writer_tx);
-    let (global_report, c, u, a, num_records) = match writer_handle.join() {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!("Writer thread panicked"),
-    };
+            writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
+            for (taxid, count) in &sorted {
+                let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
+                let taxid_label = if *taxid == u32::MAX { "Ambiguous".to_string() } else { taxid.to_string() };
+                writeln!(writer, "{}\t{}\t{:0.3}", taxid_label, count, ratio)?;
+            }
+            writer.flush()?;
+        }
 
-    match reader_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!("Reader thread panicked"),
+        if c + u + a != num_records {
+            eprintln!("WARNING: C+U+A is not adding up to number of reads");
+        }
+        eprintln!("Classified:   {}", c);
+        eprintln!("Ambiguous:    {}", a);
+        eprintln!("Unclassified: {}", u);
+        eprintln!("Total:        {}", num_records);
+        eprintln!();
     }
-
     let classify_elapsed = classify_start.elapsed();
 
-    {
-        let f = File::create(format!("{}.report", config.output_prefix))?;
-        let mut writer = io::BufWriter::new(f);
-        let mut sorted: Vec<(u32, usize)> = global_report.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-        writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
-        for (taxid, count) in &sorted {
-            let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
-            let taxid_label = if *taxid == u32::MAX { "Ambiguous".to_string() } else { taxid.to_string() };
-            writeln!(writer, "{}\t{}\t{:0.3}", taxid_label, count, ratio)?;
-        }
-        writer.flush()?;
-    }
-
-    if c + u + a != num_records {
-        eprintln!("WARNING: C+U+A is not adding up to number of reads");
-    }
-
-    eprintln!("Classified:   {}", c);
-    eprintln!("Ambiguous:    {}", a);
-    eprintln!("Unclassified: {}", u);
-    eprintln!("Total:        {}", num_records);
-    // eprintln!("DB load:      {:.2}s", db_elapsed.as_secs_f64());
-    eprintln!("Classify:     {:.2}s", classify_elapsed.as_secs_f64());
-    // eprintln!("Total time:   {:.2}s", db_elapsed.as_secs_f64() + classify_elapsed.as_secs_f64());
-    // if classify_elapsed.as_secs_f64() > 0.0 {
-    //     eprintln!("Throughput:   {:.0} reads/s", num_records as f64 / classify_elapsed.as_secs_f64());
-    // }
+    eprintln!("Took {:.2}s to classify sample(s)", classify_elapsed.as_secs_f64());
     Ok(())
 }
 

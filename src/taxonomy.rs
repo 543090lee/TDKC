@@ -62,10 +62,6 @@ impl TaxonomyTree {
     pub fn children(&self) -> &HashMap<u32, Vec<u32>> {
         &self.children
     }
-
-    // pub fn parent_map(&self) -> &HashMap<u32, u32> {
-    //     &self.parent
-    // }
 }
 
 // This is Kraken2 style assigning internal IDs to the nodes. This is only used for tracking in full-taxon setting.

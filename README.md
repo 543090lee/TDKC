@@ -85,6 +85,8 @@ You can find `targets.txt` in the `data` directory. Target taxa list is made of 
 
 ### 3. Query
 
+Query a single sample:
+
 ```bash
 tdkc query \
   -d my_db \
@@ -94,10 +96,25 @@ tdkc query \
   -o results/sample
 ```
 
+Or query an entire directory of FASTQ files at once:
+
+```bash
+tdkc query \
+  -d my_db \
+  -i /data/fastq_dir/ \
+  -j 32 \
+  -o results/
+```
+
+TDKC will auto-detect reads in the directory and process them sequentially. Output files are written into the directory specified by `-o`.
+
 Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-1` | — | R1 FASTQ (required unless `-i` is used) |
+| `-2` | — | R2 FASTQ (optional, for paired-end) |
+| `-i` | — | Input directory of FASTQ files (alternative to `-1`/`-2`) |
 | `-g` | `2` | Min distinct minimizer hit groups |
 | `-a` | off | Output per-read accession hits (requires TDKC-A db) |
 | `-b` | off | Enable domain Bloom filter background labels |
@@ -111,11 +128,18 @@ tdkc build-domain \
   -d my_db \
   --bacteria /data/bacteria.fna \
   --viral    /data/viral.fna \
-  --archaea /data/archaea.fna
+  --archaea /data/archaea.fna \
   -j 32
 ```
 
 Activate at query time with `-b` to classify against broad domains too.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-p` | `0.0001` | Bloom filter false positive rate (e.g. `0.001` for 0.1%) |
+| `-j` | all cores | Threads |
+
+> **Note:** Lower FPR values produce more accurate domain classification but require more memory. The default 0.01% FPR is recommended for most use cases — raising it significantly (e.g. above 0.1%) may introduce spurious hits...
 
 ---
 
@@ -139,7 +163,7 @@ Activate at query time with `-b` to classify against broad domains too.
 
 ```bibtex
 @article{lee2026tdkc,
-  title   = {TDKC: Fast and Memory-Efficient Sequence Classification
+  title   = {TDKC: Ultrafast and Memory-Efficient Sequence Classification
              for Target Pathogen Diagnostics},
   author  = {Lee, Seungmo and Eskin, Eleazar},
   year    = {2026},

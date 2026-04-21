@@ -55,7 +55,7 @@ impl AccessionRegistry {
         let mut lines = BufReader::new(
             File::open(path).context("Cannot open accession registry")?
         ).lines();
-        lines.next(); // skip header
+        lines.next();
 
         for line in lines {
             let line = line?;
@@ -578,16 +578,14 @@ impl KmerDatabase {
 
         // .mphf
        let mphf: Mphf<u64> = {
-            let f = File::open(format!("{}.mphf", prefix))
-                .context("Cannot open .mphf file")?;
+            let f = File::open(format!("{}.mphf", prefix)).context("Cannot open .mphf file")?;
             let reader = BufReader::new(f);
             bincode::deserialize_from(reader)?
         };
 
         // .fp
         let fingerprints = {
-            let mut f = File::open(format!("{}.fp", prefix))
-                .context("Cannot open .fp file")?;
+            let mut f = File::open(format!("{}.fp", prefix)).context("Cannot open .fp file")?;
             let mut fp = vec![0u16; num_minimizers];
             let byte_slice = unsafe {
                 std::slice::from_raw_parts_mut(fp.as_mut_ptr() as *mut u8, num_minimizers * 2)
@@ -598,8 +596,7 @@ impl KmerDatabase {
 
         // .taxid
         let taxid_indices = {
-            let mut f = File::open(format!("{}.taxid", prefix))
-                .context("Cannot open .taxid file")?;
+            let mut f = File::open(format!("{}.taxid", prefix)).context("Cannot open .taxid file")?;
             let mut v = vec![0u8; num_minimizers];
             f.read_exact(&mut v)?;
             v
@@ -607,8 +604,7 @@ impl KmerDatabase {
 
         // .taxmap
         let (index_to_taxid, ancestor_matrix) = {
-            let mut f = File::open(format!("{}.taxmap", prefix))
-                .context("Cannot open .taxmap file")?;
+            let mut f = File::open(format!("{}.taxmap", prefix)).context("Cannot open .taxmap file")?;
             let mut buf8 = [0u8; 8];
             f.read_exact(&mut buf8)?;
             let sz = u64::from_le_bytes(buf8) as usize;

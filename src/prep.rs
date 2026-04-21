@@ -172,7 +172,7 @@ fn lookup_accession2taxid(
 
     let mut remaining = fasta_accessions.len();
     if remaining == 0 {
-        eprintln!("  All accessions pre-mapped from headers, skipping accession2taxid stream!");
+        eprintln!("All accessions pre-mapped from headers, skipping accession2taxid stream!");
         return Ok(());
     }
 
@@ -197,7 +197,7 @@ fn lookup_accession2taxid(
 
             if line_count % 10_000_000 == 0 {
                 eprint!(
-                    "\r    {}M lines, found {}...",
+                    "\r{}M lines, found {}...",
                     line_count / 1_000_000,
                     acc_to_taxid.len()
                 );

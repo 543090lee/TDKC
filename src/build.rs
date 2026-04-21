@@ -57,7 +57,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         })
         .collect();
     eprintln!(
-        "  {} accessions have taxids in taxonomy tree",
+        "{} accessions have taxids in taxonomy tree",
         acc_to_internal.len()
     );
 
@@ -67,7 +67,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         .map(|(acc, _): (&String, &u32)| acc.clone())
         .collect();
     eprintln!(
-        "  {} accessions belong to target clades",
+        "{} accessions belong to target clades",
         target_accessions.len()
     );
 
@@ -114,7 +114,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     )?;
 
     let remove_count = to_remove.len();
-    eprintln!("  {} minimizers found in non-target, removing...", remove_count);
+    eprintln!("{} minimizers found in non-target, removing...", remove_count);
 
     challenge_bulk_remove(&global, &to_remove);
     drop(to_remove);
@@ -125,7 +125,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         .map(|s| s.read().unwrap().len())
         .sum();
     eprintln!(
-        "  {} minimizers survived, abd {} removed by challenge",
+        "{} minimizers survived, abd {} removed by challenge",
         total_surviving,
         total_target_minimizers.saturating_sub(total_surviving)
     );
@@ -185,8 +185,8 @@ fn build_database_from_shards(
         }
     }
 
-    eprintln!("  Found {} unique taxIDs", unique_taxids.len());
-    eprintln!("  {} unique minimizers", num_minimizers);
+    eprintln!("Found {} unique taxIDs", unique_taxids.len());
+    eprintln!("{} unique minimizers", num_minimizers);
 
     if unique_taxids.len() > 255 {
         anyhow::bail!(
@@ -582,7 +582,7 @@ fn extract_target_minimizers(
     match reader_handle.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!("reader thread panicked"),
+        Err(_) => anyhow::bail!("Reader thread panicked"),
     }
 
     Ok(())
