@@ -387,6 +387,7 @@ pub struct KmerDatabase {
     pub index_to_taxid: Vec<u32>,
     pub ancestor_matrix: Vec<u8>,
     accessions: Option<EqClassAccessions>,
+    pub names_map: Option<rustc_hash::FxHashMap<u32, String>>,
 }
 
 impl KmerDatabase {
@@ -404,11 +405,12 @@ impl KmerDatabase {
         index_to_taxid: Vec<u32>,
         ancestor_matrix: Vec<u8>,
         accessions: Option<EqClassAccessions>,
+        names_map: Option<rustc_hash::FxHashMap<u32, String>>,
     ) -> Self {
         Self {
             k, l, spaced_seed_mask, toggle_mask,
             num_minimizers, mphf, fingerprints, taxid_indices,
-            index_to_taxid, ancestor_matrix, accessions,
+            index_to_taxid, ancestor_matrix, accessions, names_map
         }
     }
 
@@ -433,6 +435,19 @@ impl KmerDatabase {
             Some(ref acc) => acc.decode_class(class_id),
             None => Vec::new(),
         }
+    }
+
+    pub fn get_taxid_name(&self, taxid: u32) -> String {
+        if taxid == u32::MAX {
+            return "\t".to_string();
+        }
+
+        if let Some(names_map) = &self.names_map {
+            if let Some(name) = names_map.get(&taxid) {
+                return name.clone();
+            }
+        }
+        "Unknown".to_string()
     }
 
     pub fn query_into(
@@ -550,6 +565,8 @@ impl KmerDatabase {
             w.flush()?;
         }
         
+        //names.dmp is saved separately and directly in build.rs
+
         if let Some(ref acc) = self.accessions {
             acc.save(&format!("{}.accession", prefix))?;
         }
@@ -621,6 +638,27 @@ impl KmerDatabase {
             (v, anc)
         };
 
+        // .names
+        let names_map = {
+            let path = format!("{}.names", prefix);
+            if let Ok(file) = File::open(&path) {
+                use std::io::BufRead;
+                let reader = BufReader::new(file);
+                let mut map = rustc_hash::FxHashMap::default();
+                for line in reader.lines().flatten() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() == 2 {
+                        if let Ok(taxid) = parts[0].parse::<u32>() {
+                            map.insert(taxid, parts[1].to_string());
+                        }
+                    }
+                }
+                Some(map)
+            } else {
+                None
+            }
+        };
+
         let acc_path = format!("{}.accession", prefix);
         let accessions = if load_accessions && has_acc && Path::new(&acc_path).exists() {
             Some(EqClassAccessions::load(&acc_path)?)
@@ -629,7 +667,7 @@ impl KmerDatabase {
         };
         Ok(Self {
             k, l, spaced_seed_mask, toggle_mask, num_minimizers,
-            mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions,
+            mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions, names_map, 
         })
     }
 }

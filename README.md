@@ -69,6 +69,7 @@ tdkc build \
   --prelim-map   prep_output/prelim_map.txt \
   -t /data/targets.txt \
   -n nodes.dmp \
+  -m names.dmp \
   -o my_db \
   -j 32
 ```
@@ -79,8 +80,8 @@ You can find `targets.txt` in the `data` directory. Target taxa list is made of 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-j` | all cores | Threads |
-| `-w` | `35` | Window size k |
-| `-m` | `31` | Minimizer length l |
+| `-k` | `35` | Window size k |
+| `-l` | `31` | Minimizer length l |
 | `-a` | off | Enable accession tracking |
 
 ---

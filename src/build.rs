@@ -23,6 +23,7 @@ pub struct BuildConfig {
     pub track_accessions: bool,
     pub k: usize,
     pub l: usize,
+    pub names_dmp_path: String,
 }
 
 const NUM_SHARDS: usize = 256;
@@ -44,9 +45,15 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     eprintln!("Loading target TaxIDs...");
     let targets = load_target_taxids(&config.targets_file)?;
     let taxid_manager = TargetTaxIDManager::new(&targets, &taxonomy);
-    let relevant_taxids = taxid_manager.all_relevant_taxids();
-    let bfs_tax = BfsTaxonomy::build(&taxonomy, &relevant_taxids);
 
+    // Roll up 
+    let relevant_taxids = taxid_manager.all_relevant_taxids();
+    // intenral taxIDs
+    let bfs_tax = BfsTaxonomy::build(&taxonomy, &relevant_taxids);
+    // taxID to name matcher
+    let name_file = format!("{}.names", config.db_prefix);
+    crate::taxonomy::lookup_names(&config.names_dmp_path, &targets, &name_file)?;
+    
     eprintln!("\nLoading prelim_map...");
     let acc_to_taxid = load_prelim_map(&config.prelim_map_file)?;
 
@@ -66,7 +73,8 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         .filter(|(_, int_id): &(&String, &u32)| bfs_tax.is_relevant(**int_id))
         .map(|(acc, _): (&String, &u32)| acc.clone())
         .collect();
-    eprintln!(
+    
+        eprintln!(
         "{} accessions belong to target clades",
         target_accessions.len()
     );
@@ -295,6 +303,7 @@ fn build_database_from_shards(
         index_to_taxid,
         ancestor_matrix,
         accessions,
+        None,
     ))
 }
 

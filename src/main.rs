@@ -50,7 +50,7 @@ enum Commands {
         #[arg(long)]
         prelim_map: String,
 
-        #[arg(short = 't', long)]
+        #[arg(short = 't', long = "target-list")]
         targets: String,
 
         #[arg(short = 'n', long)]
@@ -62,14 +62,17 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
-        #[arg(short = 'w', long, default_value_t = 35)]
+        #[arg(short = 'k', long, default_value_t = 35)]
         window_size: usize,
 
-        #[arg(short = 'm', long, default_value_t = 31)]
+        #[arg(short = 'l', long, default_value_t = 31)]
         minimizer_size: usize,
 
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long = "accession2taxid")]
         accession: bool,
+
+         #[arg(short = 'm', long)]
+        names: String,
     },
 
     Query {
@@ -88,7 +91,7 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = 1)]
         threads: usize,
 
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long = "accession-tracking")]
         accession: bool,
 
         // Same config as Kraken2
@@ -159,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             accession,
             window_size,
             minimizer_size,
+            names,
         } => {
             build::run_build(build::BuildConfig {
                 fasta_file: fasta,
@@ -171,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 track_accessions: accession,
                 k: window_size,
                 l: minimizer_size,
+                names_dmp_path: names,
             })?;
         }
 

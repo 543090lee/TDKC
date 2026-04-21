@@ -182,11 +182,13 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             let mut sorted: Vec<(u32, usize)> = global_report.into_iter().collect();
             sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-            writeln!(writer, "Target_TaxID\tRead_Count\tRatio")?;
+            writeln!(writer, "Target_TaxID\tName\tRead_Count\tRatio")?;
             for (taxid, count) in &sorted {
                 let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
                 let taxid_label = if *taxid == u32::MAX { "Ambiguous".to_string() } else { taxid.to_string() };
-                writeln!(writer, "{}\t{}\t{:0.3}", taxid_label, count, ratio)?;
+                let name = db.get_taxid_name(*taxid);
+                
+                writeln!(writer, "{}\t{}\t{}\t{:0.3}", taxid_label, name, count, ratio)?;
             }
             writer.flush()?;
         }

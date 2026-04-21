@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use anyhow::{Context, Result};
-
+use std::io::Write;
 
 pub const TAXID_VIRAL: u32 = 10239;
 pub const TAXID_BACTERIA: u32 = 2;
@@ -208,6 +208,49 @@ pub fn load_target_taxids(path: &str) -> Result<HashSet<u32>> {
     }
     eprintln!("Loaded {} target taxids", targets.len());
     Ok(targets)
+}
+
+pub fn lookup_names(
+    names_dmp_path: &str, 
+    db_taxids: &HashSet<u32>, 
+    output_path: &str
+) -> Result<()> {
+    
+    let mut out_file = File::create(output_path)?;
+
+    // hard-code these in
+    let core_domains = [
+        (TAXID_ROOT, "root"),
+        (TAXID_CELLULAR, "cellular organisms"),
+        (TAXID_BACTERIA, "Bacteria"),
+        (TAXID_ARCHAEA, "Archaea"),
+        (TAXID_VIRAL, "Viruses"),
+        (TAXID_FUNGI, "Fungi"),
+    ];
+
+    for (tid, name) in core_domains {
+        writeln!(out_file, "{}\t{}", tid, name)?;
+    }
+    let file = File::open(names_dmp_path)?;
+    let reader = io::BufReader::new(file);
+    let mut found = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts: Vec<&str> = line.split("\t|\t").collect();
+        if parts.len() < 4 { continue; }
+
+        let taxid: u32 = parts[0].trim().parse().unwrap_or(0);
+        let name = parts[1].trim();
+        // the 4th column has the class, and we want "scientific name"
+        let name_class = parts[3].replace("\t|", "").trim().to_string();
+
+        if name_class == "scientific name" && db_taxids.contains(&taxid) {
+            writeln!(out_file, "{}\t{}", taxid, name)?;
+            found += 1;
+        }
+    }
+    Ok(())
 }
 
 #[inline]

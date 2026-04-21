@@ -54,9 +54,12 @@ pub fn discover_samples(dir: &Path) -> Result<Vec<Sample>> {
         }
     }
 
-    let valid_samples: Vec<Sample> = sample_map.into_values()
+    let mut valid_samples: Vec<Sample> = sample_map.into_values()
         .filter(|s| s.r1.exists())
         .collect();
 
+    // sort so it processes from A01 through H12 cleanly
+    valid_samples.sort_by(|a, b| a.name.cmp(&b.name));
+    
     Ok(valid_samples)
 }
