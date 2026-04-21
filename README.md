@@ -10,6 +10,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 [![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://github.com/543090lee/TDKC)
+[![version](https://img.shields.io/badge/version-v0.1.0-lightgrey?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC)
+
 
 [Paper](https://github.com/543090lee/TDKC) · [Getting Started](#quick-start) · [Citation](#citation)
 
