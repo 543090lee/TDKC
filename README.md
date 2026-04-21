@@ -18,14 +18,22 @@
 </div>
 
 ---
-
 ## Installation
 
-**Prerequisites:**
-- [Rust ≥ 1.70](https://rustup.rs/)
-- [`seqtk`](https://github.com/lh3/seqtk): `conda install -c bioconda seqtk`
-- [`ripgrep`](https://github.com/BurntSushi/ripgrep): `cargo install ripgrep`
+```bash
+git clone https://github.com/543090lee/TDKC.git
+cd TDKC
+conda env create -f environment.yml
+conda activate tdkc
+cargo install --path .
+```
 
+The binary will be at `./target/release/tdkc` (and also on your `PATH` inside the `tdkc` env).
+
+<details>
+<summary><b>Manual install (without conda)</b></summary>
+
+Then:
 
 ```bash
 git clone https://github.com/543090lee/TDKC.git
@@ -33,7 +41,9 @@ cd TDKC
 cargo install --path .
 ```
 
-The binary will be at `./target/release/tdkc`.
+</details>
+
+> **Troubleshooting:** If you see `CMake 3.14...3.31.0 or higher is required`, your system CMake is too old. The conda install above avoids this entirely. To fix manually: `conda install -c conda-forge cmake` or upgrade via your system package manager.
 
 ---
 

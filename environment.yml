@@ -1,0 +1,13 @@
+name: tdkc
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - rust>=1.70
+  - cmake>=3.14
+  - c-compiler
+  - cxx-compiler
+  - make
+  - pkg-config
+  - seqtk
+  - ripgrep
