@@ -30,7 +30,7 @@
 ```bash
 git clone https://github.com/543090lee/TDKC.git
 cd TDKC
-cargo build --release
+cargo install --path .
 ```
 
 The binary will be at `./target/release/tdkc`.
