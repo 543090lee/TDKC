@@ -91,7 +91,7 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = 1)]
         threads: usize,
 
-        #[arg(short = 'a', long = "accession-tracking")]
+        #[arg(short = 'a', long = "accession-tracking", conflicts_with = "no_output")]
         accession: bool,
 
         // Same config as Kraken2
@@ -104,6 +104,9 @@ enum Commands {
 
         #[arg(short = 'b', long)]
         background: bool,
+
+        #[arg(long, help = "only generates .report")]
+        no_output: bool,
     },
 
     BuildDomain {
@@ -188,7 +191,8 @@ fn main() -> anyhow::Result<()> {
             accession,
             minimum_hit_groups,
             output_prefix,
-            background
+            background,
+            no_output
         } => {
             let mut samples = Vec::new();
             if let Some(dir_path) = input_dir {
@@ -223,7 +227,8 @@ fn main() -> anyhow::Result<()> {
                 use_accessions: accession,
                 minimum_hit_groups,
                 output_prefix,
-                background
+                background,
+                no_output
             })?;
         }
 

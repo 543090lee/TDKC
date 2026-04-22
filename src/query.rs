@@ -19,6 +19,7 @@ pub struct QueryConfig {
     pub background: bool,
     pub minimum_hit_groups: usize,
     pub output_prefix: String,
+    pub no_output: bool,
 }
 
 pub struct FlatBatch {
@@ -100,8 +101,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         };
 
         eprintln!();
+        let no_output = config.no_output;
+        let out_prefix_clone = out_prefix.clone();
+
         // thread only to write, no lock, so less overhead
-        let output_file = File::create(format!("{}.output", out_prefix))?;
         // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
         // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
@@ -109,9 +112,14 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
             //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
             //when it;s full
-            let mut writer = io::BufWriter::with_capacity(4 * 1024 * 1024, output_file);
+            let mut writer = if !no_output {
+                let output_file = File::create(format!("{}.output", out_prefix_clone))?;
+                Some(io::BufWriter::with_capacity(4 * 1024 * 1024, output_file))
+            } else {
+                None
+            };            
+            
             let mut global_report: HashMap<u32, usize> = HashMap::new();
-
             // I could use AtomicUsize for these, since these are single values, but too lazy
             let mut total_c: usize = 0;
             let mut total_u: usize = 0;
@@ -119,7 +127,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             let mut total_n: usize = 0;
 
             for batch in writer_rx {
-                writer.write_all(&batch.output_data)?;
+                if let Some(ref mut w) = writer {
+                    w.write_all(&batch.output_data)?;
+                }
                 for (taxid, count) in batch.report_counts {
                     *global_report.entry(taxid).or_default() += count;
                 }
@@ -128,7 +138,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 total_a += batch.ambiguous;
                 total_n += batch.num_records;
             }
-            writer.flush()?;
+
+            if let Some(ref mut w) = writer {
+                w.flush()?;
+            }
             Ok((global_report, total_c, total_u, total_a, total_n))
         });
 
@@ -159,6 +172,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 config.minimum_hit_groups,
                 is_paired,
                 &bg_filters,
+                config.no_output
             );
             let _ = writer_tx.send(result);
         });
@@ -224,9 +238,10 @@ fn classify_batch(
     min_hit_groups: usize,
     is_paired: bool,
     bg_filters: &[(DomainBloomFilter, u32)],
+    no_output: bool,
 ) -> BatchResult {
     let batch_len = batch.batch1.offsets.len();    
-    let mut local_output: Vec<u8> = Vec::with_capacity(batch_len * 200);
+    let mut local_output: Vec<u8> = if no_output { Vec::new() } else { Vec::with_capacity(batch_len * 200) };
     let mut local_report: FxHashMap<u32, usize> = FxHashMap::default();
     let mut local_classified: usize = 0;
     let mut local_unclassified: usize = 0;
@@ -306,14 +321,15 @@ fn classify_batch(
 
         //Unclassified
         if valid_hits == 0 || effective_hit_groups < min_hit_groups {
-            write_prefix(&mut local_output, "U", &0);
-            write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-            if has_r2 {
-                local_output.extend_from_slice(b" |:| ");
-                write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+            if !no_output {
+                write_prefix(&mut local_output, "U", &0);
+                write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+                if has_r2 {
+                    local_output.extend_from_slice(b" |:| ");
+                    write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                }
+                local_output.push(b'\n');
             }
-
-            local_output.push(b'\n');
             local_unclassified += 1;
         } else {
             let n = db.index_to_taxid.len();
@@ -400,25 +416,29 @@ fn classify_batch(
                 // Classified
                 if let Some(final_idx) = resolved_taxid_idx {
                     let best_taxid = db.true_taxid(final_idx);
-                    write_prefix(&mut local_output, "C", &best_taxid);
-                    write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                    if has_r2 {
-                        local_output.extend_from_slice(b" |:| ");
-                        write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                    if !no_output {
+                        write_prefix(&mut local_output, "C", &best_taxid);
+                        write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+                        if has_r2 {
+                            local_output.extend_from_slice(b" |:| ");
+                            write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                        }
+                        local_output.push(b'\n');
                     }
-                    local_output.push(b'\n');
                     *local_report.entry(best_taxid).or_default() += 1;
                     local_classified += 1;
                 } else {
                     // no LCA then it's ambiguous
-                    let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
-                    write_prefix(&mut local_output, "A", &tied_taxids_str);
-                    write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                    if has_r2 {
-                        local_output.extend_from_slice(b" |:| ");
-                        write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                    if !no_output {
+                        let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
+                        write_prefix(&mut local_output, "A", &tied_taxids_str);
+                        write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+                        if has_r2 {
+                            local_output.extend_from_slice(b" |:| ");
+                            write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                        }
+                        local_output.push(b'\n');
                     }
-                    local_output.push(b'\n');
                     *local_report.entry(u32::MAX).or_default() += 1; 
                     local_ambiguous += 1;
                 }
@@ -431,13 +451,15 @@ fn classify_batch(
                 };
 
                 // background classified
-                write_prefix(&mut local_output, "C", &final_bg_taxid);
-                write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                if has_r2 {
-                    local_output.extend_from_slice(b" |:| ");
-                    write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                if !no_output {
+                    write_prefix(&mut local_output, "C", &final_bg_taxid);
+                    write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
+                    if has_r2 {
+                        local_output.extend_from_slice(b" |:| ");
+                        write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                    }
+                    local_output.push(b'\n');
                 }
-                local_output.push(b'\n');
                 
                 *local_report.entry(final_bg_taxid).or_default() += 1;
                 local_classified += 1;
