@@ -459,15 +459,31 @@ impl KmerDatabase {
         bg_filters: &[(DomainBloomFilter, u32)],
     ) {
         scanner.scan_into(seq, minimizer_buf);
-        let has_acc = self.accessions.is_some();
-
         out.reserve(minimizer_buf.len());
+        
+        let acc_ref = self.accessions.as_ref();
+        
+        let mut last_m = u64::MAX;
+        let mut last_hit = Hit { 
+            taxid_idx: 0, 
+            accession_class_id: None, 
+            is_hit: false, 
+            bg_taxid: 0 
+        };
+
         for &m in minimizer_buf.iter() {
             if m == u64::MAX {
                 out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid: 0 });
+                last_m = u64::MAX;
                 continue;
             }
 
+            if m == last_m {
+                out.push(last_hit);
+                continue;
+            }
+
+            last_m = m;
             let mut is_hit = false;
             let mut hit_idx = 0;
 
@@ -479,17 +495,13 @@ impl KmerDatabase {
                 }
             }
 
-            if is_hit {
-                out.push(Hit {
+            let new_hit = if is_hit {
+                Hit {
                     taxid_idx: self.taxid_indices[hit_idx],
-                    accession_class_id: if has_acc {
-                        self.accessions.as_ref().unwrap().get_class_id(hit_idx)
-                    } else {
-                        None
-                    },
+                    accession_class_id: acc_ref.and_then(|a| a.get_class_id(hit_idx)),
                     is_hit: true,
                     bg_taxid: 0,
-                });
+                }
             } else {
                 let mut hit_taxids = [0u32; 4]; 
                 let mut match_count = 0;
@@ -506,12 +518,19 @@ impl KmerDatabase {
                 let bg_taxid = match match_count {
                     0 => 0,
                     1 => hit_taxids[0], 
-                    _ => resolve_domain_lca(
-                        hit_taxids[..match_count.min(4)].iter()
-                    ),
+                    _ => resolve_domain_lca(hit_taxids[..match_count.min(4)].iter()),
                 };
-                out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid });
-            }
+
+                Hit { 
+                    taxid_idx: 0, 
+                    accession_class_id: None, 
+                    is_hit: false, 
+                    bg_taxid 
+                }
+            };
+
+            last_hit = new_hit;
+            out.push(new_hit);
         }
     }
 
@@ -712,9 +731,11 @@ impl DomainBloomFilter {
     // }
 }
 
+#[derive(Clone, Copy)]
 pub struct Hit {
     pub taxid_idx: u8,
     pub accession_class_id: Option<u32>,
     pub is_hit: bool,
     pub bg_taxid: u32, 
 }
+
