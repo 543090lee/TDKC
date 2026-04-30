@@ -11,3 +11,4 @@ dependencies:
   - pkg-config
   - seqtk
   - ripgrep
+  - blast

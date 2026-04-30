@@ -309,7 +309,7 @@ fn build_database_from_shards(
 
 fn presort_accessions_by_lineage(
     target_accessions: &HashSet<String>,
-    acc_to_taxid: &HashMap<String, u32>,
+    acc_to_taxid: &FxHashMap<String, u32>,
     taxonomy: &TaxonomyTree,
     taxid_manager: &TargetTaxIDManager,
 ) -> Result<AccessionRegistry> {

@@ -2,6 +2,8 @@ mod build;
 mod database;
 mod minimizer;
 mod prep;
+mod prep_download; 
+mod prep_pipeline; 
 mod query;
 mod taxonomy;
 mod utils;
@@ -22,22 +24,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-
     Prep {
-        #[arg(short = 'f', long)]
-        fasta: String,
-
-        #[arg(short = 'x', long, num_args = 1.., required = true)]
-        accession2taxid: Vec<String>,
+        /// You can download archaea, bacteria, fungi, invertebrate, plants, plastid, protozoa, human, or none 
+        #[arg(long, default_value = "bacteria,viral,archaea,human")]
+        domains: String,
 
         #[arg(short = 't', long)]
         targets: String,
 
-        #[arg(short = 'n', long)]
-        nodes: String,
-
-        #[arg(short = 'o', long)]
+        #[arg(short = 'o', long, default_value = "prep_output")]
         output_dir: String,
+
+        #[arg(long, default_value = "http")]
+        backend: String,
+
+        #[arg(long, default_value_t = 6)]
+        concurrent_downloads: usize,
+
+        #[arg(long, default_value_t = 2)]
+        in_flight_chunks: usize,
+
+        /// Optional path to a custom FASTA file to include alongside RefSeq downloads
+        #[arg(long)]
+        custom: Option<String>,
     },
 
     Build {
@@ -71,7 +80,7 @@ enum Commands {
         #[arg(short = 'a', long = "accession2taxid")]
         accession: bool,
 
-         #[arg(short = 'm', long)]
+        #[arg(short = 'm', long)]
         names: String,
     },
 
@@ -94,11 +103,9 @@ enum Commands {
         #[arg(short = 'a', long = "accession-tracking", conflicts_with = "no_output")]
         accession: bool,
 
-        // Same config as Kraken2
         #[arg(short = 'g', long, default_value_t = 2)]
         minimum_hit_groups: usize,
 
-        // This can also be output dir name, not only prefix when just single fastq file is queried.
         #[arg(short = 'o', long)]
         output_prefix: String,
 
@@ -116,7 +123,6 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
 
-        // default is 0.01% fp rate, higher than this might result in spurious hits...
         #[arg(short = 'p', long, default_value_t = 0.0001)]
         fpr: f64,
 
@@ -134,24 +140,29 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Prep {
-            fasta,
-            accession2taxid,
+            domains,
             targets,
-            nodes,
             output_dir,
+            backend,
+            concurrent_downloads,
+            in_flight_chunks,
+            custom,
         } => {
             prep::run_prep(prep::PrepConfig {
-                fasta_file: fasta,
-                accession2taxid_files: accession2taxid,
+                domains,
                 targets_file: targets,
-                nodes_file: nodes,
                 output_dir,
-            })?;
+                backend,
+                concurrent_downloads,
+                in_flight_chunks,
+                custom_fasta: custom,
+            }).await?;
         }
 
         Commands::Build {

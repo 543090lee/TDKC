@@ -26,13 +26,14 @@ cd TDKC
 conda env create -f environment.yml
 conda activate tdkc
 cargo install --path .
+
+# or with mamba (faster)
+mamba env create -f environment.yml
+mamba activate tdkc
 ```
 
 The binary will be at `./target/release/tdkc` (and also on your `PATH` inside the `tdkc` env).
 
-</details>
-
-> **Troubleshooting:** If you see `CMake 3.14...3.31.0 or higher is required`, your system CMake is too old. The conda install above avoids this entirely. To fix manually: `conda install -c conda-forge cmake` or upgrade via your system package manager.
 
 ---
 
@@ -42,24 +43,49 @@ TDKC has three main steps: `prep` → `build` → `query`.
 
 ### 1. Prep
 
-Extract target sequences and build an accession to taxid map.
+Download reference sequences from NCBI via **HTTPS** (no FTP or rsync), filter to your target taxa, and produce a local accession2taxid map.
 
 ```bash
 tdkc prep \
-  -f /data/refseq.fna.gz \
-  -x /data/nucl_gb.accession2taxid \
-  -t targets.txt \
-  -n nodes.dmp \
+  --domains bacteria,viral,human,archaea \
+  -t data/targets.txt \
   -o prep_output/
 ```
 
-Outputs: `prep_output/prelim_map.txt`, `prep_output/target.fasta`
+**Adding a user-supplied FASTA (GenBank / WGS)**
 
----
+You can supplement the RefSeq downloads with a local FASTA file using `--custom`. 
+
+</details>
+
+> **Coming soon:** Support for arbitrary custom FASTA files (sequences not registered in GenBank/WGS) is under development.
+
+```bash
+tdkc prep \
+  --domains bacteria,viral,human,archaea \
+  -t data/targets.txt \
+  -o prep_output/ \
+  --custom /data/my_genbank_sequences.fasta
+```
+
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--domains` | `bacteria,viral,archaea,human` | Comma-separated RefSeq domains to download. Valid values: `bacteria`, `viral`, `archaea`, `human`, `fungi`, `invertebrate`, `plant`, `plastid`, `protozoa`. UniVec_Core is always included automatically. |
+| `-t` / `--targets` | — | Path to targets file (one NCBI taxid per line, any rank) |
+| `-o` / `--output-dir` | `prep_output` | Output directory |
+| `--custom` | — | Path to a local FASTA file to include. |
+| `--concurrent-downloads` | `6` | Number of genome files being streamed from NCBI in parallel. I don't recommend going over 6, NCBI server might complain... |
+| `--in-flight-chunks` | `2` | Number of dust-masking jobs to run in parallel |
+
 
 ### 2. Build
 
 Distill the target k-mer index.
+
+</details>
+
+> **Coming soon:** Instead of inputting each necessary files to build, make a single dir/database that will automatically detect the files.
 
 ```bash
 tdkc build \
@@ -119,7 +145,7 @@ Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 | `-i` | — | Input directory of FASTQ files (alternative to `-1`/`-2`) |
 | `-g` | `2` | Min distinct minimizer hit groups |
 | `-a` | off | Output per-read accession hits (requires TDKC-A db) |
-| `-b` | off | Enable domain Bloom filter background labels |
+| `-b` | off | Enable domain-level detection |
 
 ---
 
