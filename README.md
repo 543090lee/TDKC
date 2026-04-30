@@ -83,13 +83,13 @@ tdkc prep \
 
 Distill the target k-mer index.
 
-</details>
+> **Coming soon:** Instead of inputting each necessary files to build, make a single dir/database that will automatically detect the files.  
+> This will fix issue with needing to concatenate all domain reference sequences into one all.fna.
 
-> **Coming soon:** Instead of inputting each necessary files to build, make a single dir/database that will automatically detect the files.
 
 ```bash
 tdkc build \
-  -f /data/refseq.fna.gz \
+  -f /data/all.fna \
   --target-fasta prep_output/target.fasta \
   --prelim-map   prep_output/prelim_map.txt \
   -t /data/targets.txt \
@@ -168,21 +168,6 @@ Activate at query time with `-b` to classify against broad domains too.
 | `-j` | all cores | Threads |
 
 > **Note:** Lower FPR values produce more accurate domain classification but require more memory. The default 0.01% FPR is recommended for most use cases — raising it significantly (e.g. above 0.1%) may introduce spurious hits...
-
----
-
-## Input Files
-
-| File | Description |
-|------|-------------|
-| `refseq.fna` | Full reference FASTA (NCBI RefSeq) |
-| `targets.txt` | One NCBI taxid per line (any rank — genus, species, etc.) |
-| `nodes.dmp` | NCBI taxonomy `nodes.dmp` |
-| `nucl_gb.accession2taxid` `nucl_wgs.accession2taxid` | NCBI accession→taxid mapping |
-
-**RefSeq:** https://ftp.ncbi.nlm.nih.gov/genomes/refseq/  
-**Viral NT:** https://ftp.ncbi.nlm.nih.gov/genomes/Viruses/AllNucleotide/  
-**Taxonomy:** https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/
 
 
 ---
