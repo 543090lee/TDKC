@@ -83,7 +83,7 @@ tdkc prep \
 
 Distill the target k-mer index.
 
-> **Coming soon:** Instead of inputting each necessary files to build, make a single dir/database that will automatically detect the files.  
+> **Coming soon:** Instead of inputting each necessary files to build, make a single dir/database (since prep phase) that will automatically detect the files.  
 > This will fix issue with needing to concatenate all domain reference sequences into one all.fna.
 
 
