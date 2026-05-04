@@ -9,6 +9,4 @@ dependencies:
   - cxx-compiler
   - make
   - pkg-config
-  - seqtk
-  - ripgrep
   - blast
