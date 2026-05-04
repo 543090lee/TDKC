@@ -13,7 +13,7 @@ use crate::utils::{init_thread_pool,segment_ranges};
 use crate::hash::compute_fingerprint;
 
 pub struct BuildConfig {
-    pub fasta_file: String,
+    pub fasta_files: Vec<String>,
     pub target_fasta_file: String,
     pub prelim_map_file: String,
     pub targets_file: String,
@@ -115,7 +115,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
 
     eprintln!("\nChallenging minimizers...");
     let to_remove = collect_background_hits(
-        &config.fasta_file,
+        &config.fasta_files,
         &target_accessions,
         &scanner,
         &global,
@@ -621,7 +621,7 @@ impl ChallengeSegment {
 }
 
 fn collect_background_hits(
-    fasta_path: &str,
+    fasta_paths: &[String],
     target_accessions: &HashSet<String>,
     scanner: &MinimizerScanner,
     global: &ShardedMinimizerMap,
@@ -629,45 +629,48 @@ fn collect_background_hits(
     let k = scanner.k();
 
     let (tx, rx) = crossbeam_channel::bounded::<Vec<ChallengeSegment>>(4);
-    let fasta_file = fasta_path.to_string();
+    let fasta_files: Vec<String> = fasta_paths.to_vec();
     let target_acc = target_accessions.clone();
     let reader_handle = std::thread::spawn(move || -> Result<()> {
-        let mut reader = needletail::parse_fastx_file(&fasta_file)
-            .map_err(|e| anyhow::anyhow!("Cannot open FASTA: {}", e))?;
-
         let mut work_items: Vec<ChallengeSegment> = Vec::new();
         let mut batch_bytes = 0usize;
 
-        while let Some(record) = reader.next() {
-            let rec = record.map_err(|e| anyhow::anyhow!("FASTA error: {}", e))?;
-            let accession = crate::utils::extract_accession(rec.id());
+        for fasta_file in & fasta_files {
+            let mut reader = needletail::parse_fastx_file(&fasta_file)
+                .map_err(|e| anyhow::anyhow!("Cannot open FASTA: {}", e))?;
 
-            if target_acc.contains(accession) {                
-                continue;
-            }
+            while let Some(record) = reader.next() {
+                let rec = record.map_err(|e| anyhow::anyhow!("FASTA error: {}", e))?;
+                let accession = crate::utils::extract_accession(rec.id());
 
-            let seq_data = Arc::new(rec.seq().into_owned());
-            let seq_len = seq_data.len();
-            let ranges = segment_ranges(seq_len, k, SEG_TARGET_LEN);
-            for (start, end) in ranges {
-                batch_bytes += end - start;
-                work_items.push(ChallengeSegment {
-                    seq_data: Arc::clone(&seq_data),
-                    start,
-                    end,
-                });
-            }
-
-            if work_items.len() >= BATCH_ITEM_LIMIT || batch_bytes >= BATCH_BYTE_LIMIT {
-                if tx
-                    .send(std::mem::replace(&mut work_items, Vec::new()))
-                    .is_err()
-                {
-                    return Ok(());
+                if target_acc.contains(accession) {                
+                    continue;
                 }
-                batch_bytes = 0;
+
+                let seq_data = Arc::new(rec.seq().into_owned());
+                let seq_len = seq_data.len();
+                let ranges = segment_ranges(seq_len, k, SEG_TARGET_LEN);
+                for (start, end) in ranges {
+                    batch_bytes += end - start;
+                    work_items.push(ChallengeSegment {
+                        seq_data: Arc::clone(&seq_data),
+                        start,
+                        end,
+                    });
+                }
+
+                if work_items.len() >= BATCH_ITEM_LIMIT || batch_bytes >= BATCH_BYTE_LIMIT {
+                    if tx
+                        .send(std::mem::replace(&mut work_items, Vec::new()))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    batch_bytes = 0;
+                }
             }
         }
+        
         if !work_items.is_empty() {
             let _ = tx.send(work_items);
         }

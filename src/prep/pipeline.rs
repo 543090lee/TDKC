@@ -591,7 +591,6 @@ async fn run_sink(
         stats.chunks_masked += 1;
         seen_assemblies.entry(masked.assembly_accession.clone()).or_insert(());
 
-        let is_target = relevant.contains(&masked.taxid);
         for mut rec in masked.records {
             lowercase_to_x(&mut rec.seq);
 

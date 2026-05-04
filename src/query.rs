@@ -13,7 +13,7 @@ use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, T
 use read_finder::Sample;
 
 pub struct QueryConfig {
-    pub db_prefix: String,
+    pub db_dir: String,
     pub samples: Vec<Sample>,
     pub threads: usize,
     pub use_accessions: bool,
@@ -45,8 +45,9 @@ struct BatchResult {
 
 pub fn run_query(config: QueryConfig) -> Result<()> {
     init_thread_pool(config.threads);
-    
-    let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
+
+    let db_prefix = format!("{}/db", config.db_dir);
+    let db = KmerDatabase::load(&db_prefix, config.use_accessions)?;
     
     let mut bg_filters = Vec::new();
     if config.background {
@@ -57,7 +58,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             ("fungi.bloom", TAXID_FUNGI)
         ];
         for (ext, taxid) in domains {
-            let path = format!("{}.{}", config.db_prefix, ext);
+            let path = format!("{}.{}", db_prefix, ext);
             if std::path::Path::new(&path).exists() {
                 eprintln!("Loading background filter: {}", path);
                 if let Ok(filter) = DomainBloomFilter::load(&path) {
@@ -69,7 +70,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         }
     }
 
-    let acc_path = format!("{}.accessions", config.db_prefix);
+    let acc_path = format!("{}.accessions", db_prefix);
     let acc_registry = if config.use_accessions {
         match AccessionRegistry::load_for_query(&acc_path) {
             Ok(reg) => Some(reg),

@@ -13,7 +13,7 @@ use pipeline::*;
 pub struct PrepConfig {
     pub domains: String,
     pub targets_file: String,
-    pub output_dir: String,
+    pub db_dir: String,
     pub backend: String,
     pub concurrent_downloads: usize,
     pub in_flight_chunks: usize,
@@ -21,12 +21,16 @@ pub struct PrepConfig {
 }
 
 pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
-    let out_dir = PathBuf::from(&cfg.output_dir);
+    let out_dir = PathBuf::from(&cfg.db_dir);
     let genome_dir = out_dir.join("genome");
 
     tokio::fs::create_dir_all(&genome_dir)
         .await
         .context("Failed to create output genome directory")?;
+
+    tokio::fs::copy(&cfg.targets_file, out_dir.join("targets.txt"))
+        .await
+        .context("Failed to copy targets file into db dir")?;
 
     let backend = make_backend(BackendKind::Http)?;
 

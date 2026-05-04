@@ -9,6 +9,7 @@ mod build_domain;
 mod compression;
 mod hash;
 use clap::{Parser, Subcommand};
+use anyhow::Context;
 
 #[derive(Parser)]
 #[command(name = "tdkc")]
@@ -29,8 +30,8 @@ enum Commands {
         #[arg(short = 't', long)]
         targets: String,
 
-        #[arg(short = 'o', long, default_value = "prep_output")]
-        output_dir: String,
+        #[arg(short = 'd', long, default_value = "tdkc_db")]
+        db: String,
 
         #[arg(long, default_value = "http")]
         backend: String,
@@ -47,23 +48,9 @@ enum Commands {
     },
 
     Build {
-        #[arg(short = 'f', long)]
-        fasta: String,
 
-        #[arg(long)]
-        target_fasta: String,
-
-        #[arg(long)]
-        prelim_map: String,
-
-        #[arg(short = 't', long = "target-list")]
-        targets: String,
-
-        #[arg(short = 'n', long)]
-        nodes: String,
-
-        #[arg(short = 'o', long)]
-        output: String,
+        #[arg(short = 'd', long)]
+        db: String,
 
         #[arg(short = 'j', long, default_value_t = num_cpus::get())]
         threads: usize,
@@ -74,11 +61,9 @@ enum Commands {
         #[arg(short = 'l', long, default_value_t = 31)]
         minimizer_size: usize,
 
-        #[arg(short = 'a', long = "accession2taxid")]
+        #[arg(short = 'a', long)]
         accession: bool,
 
-        #[arg(short = 'm', long)]
-        names: String,
     },
 
     Query {
@@ -124,16 +109,16 @@ enum Commands {
         fpr: f64,
 
         #[arg(long)]
-        bacteria: Option<String>,
+        bacteria: bool,
 
         #[arg(long)]
-        archaea: Option<String>,
+        archaea: bool,
 
         #[arg(long)]
-        viral: Option<String>,
+        viral: bool,
 
         #[arg(long)]
-        fungi: Option<String>,
+        fungi: bool,
     },
 }
 
@@ -145,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Prep {
             domains,
             targets,
-            output_dir,
+            db,
             backend,
             concurrent_downloads,
             in_flight_chunks,
@@ -154,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
             prep::run_prep(prep::PrepConfig {
                 domains,
                 targets_file: targets,
-                output_dir,
+                db_dir: db,
                 backend,
                 concurrent_downloads,
                 in_flight_chunks,
@@ -163,30 +148,45 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Build {
-            fasta,
-            target_fasta,
-            prelim_map,
-            targets,
-            nodes,
-            output,
+            db,
             threads,
             accession,
             window_size,
             minimizer_size,
-            names,
         } => {
+            let db_path = std::path::PathBuf::from(&db);
+            let genome_dir = db_path.join("genome");
+
+            let mut fasta_files: Vec<String> = Vec::new();
+            for entry in std::fs::read_dir(&genome_dir).with_context(|| format!("Can't read {}", genome_dir.display()))? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("fna") {
+                    continue;
+                }
+                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                if fname.starts_with('_') {
+                    continue;
+                }
+                fasta_files.push(path.to_string_lossy().into_owned());
+            }
+
+            if fasta_files.is_empty() {
+                anyhow::bail!("I can't find any .fna files inside your db, are you sure you downloaded the genome files?");
+            }
+
             build::run_build(build::BuildConfig {
-                fasta_file: fasta,
-                target_fasta_file: target_fasta,
-                prelim_map_file: prelim_map,
-                targets_file: targets,
-                nodes_file: nodes,
-                db_prefix: output,
+                fasta_files,
+                target_fasta_file: db_path.join("target.fasta").to_string_lossy().into_owned(),
+                prelim_map_file: db_path.join("prelim_map.txt").to_string_lossy().into_owned(),
+                targets_file: db_path.join("targets.txt").to_string_lossy().into_owned(),
+                nodes_file: db_path.join("taxonomy/nodes.dmp").to_string_lossy().into_owned(),
+                names_dmp_path: db_path.join("taxonomy/names.dmp").to_string_lossy().into_owned(),
+                db_prefix: db_path.join("db").to_string_lossy().into_owned(),
                 threads,
                 track_accessions: accession,
                 k: window_size,
                 l: minimizer_size,
-                names_dmp_path: names,
             })?;
         }
 
@@ -229,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             query::run_query(query::QueryConfig {
-                db_prefix: db,
+                db_dir: db,
                 samples,
                 threads,
                 use_accessions: accession,
@@ -250,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
             fungi,
         } => {
             build_domain::run_build_domain(build_domain::BuildDomainConfig {
-                db_prefix: db,
+                db_dir: db,
                 threads,
                 fpr, 
                 bacteria,

@@ -64,13 +64,13 @@ impl AtomicBloom {
 }
 
 pub struct BuildDomainConfig {
-    pub db_prefix: String,
+    pub db_dir: String,
     pub threads: usize,
     pub fpr: f64,
-    pub bacteria: Option<String>,
-    pub archaea: Option<String>,
-    pub viral: Option<String>,
-    pub fungi: Option<String>,
+    pub bacteria: bool,
+    pub archaea: bool,
+    pub viral: bool,
+    pub fungi: bool,
 }
 
 struct DomainTask {
@@ -83,14 +83,40 @@ pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
     init_thread_pool(config.threads);
 
     let total_start = Instant::now();
-    let (k, l, spaced_seed_mask, toggle_mask) = load_db_meta(&config.db_prefix)?;
+    let db_path = std::path::PathBuf::from(&config.db_dir);
+    let db_prefix = db_path.join("db").to_string_lossy().into_owned();
+    let genome_dir = db_path.join("genome");
+
+    
+    let (k, l, spaced_seed_mask, toggle_mask) = load_db_meta(&db_prefix)?;
     let scanner = MinimizerScanner::new(k, l, spaced_seed_mask, toggle_mask);
 
+    let none_specified = !config.bacteria && !config.archaea && !config.viral && !config.fungi;
+    let want = |flag: bool| flag || none_specified;
+
+    let candidates = [
+        ("bacteria", config.bacteria),
+        ("archaea", config.archaea),
+        ("viral", config.viral),
+        ("fungi", config.fungi),
+    ];
+
     let mut tasks = Vec::new();
-    if let Some(path) = config.bacteria { tasks.push(DomainTask { name: "Bacteria".into(), fasta_path: path, output_ext: "bacteria.bloom".into() }); }
-    if let Some(path) = config.archaea { tasks.push(DomainTask { name: "Archaea".into(), fasta_path: path, output_ext: "archaea.bloom".into() }); }
-    if let Some(path) = config.viral { tasks.push(DomainTask { name: "Viral".into(), fasta_path: path, output_ext: "viral.bloom".into() }); }
-    if let Some(path) = config.fungi { tasks.push(DomainTask { name: "Fungi".into(), fasta_path: path, output_ext: "fungi.bloom".into() }); }
+    for (slug, flag) in candidates {
+        if !want(flag) {
+            continue;
+        }
+        let fasta_path = genome_dir.join(format!("{}.fna", slug));
+        if !fasta_path.exists() {
+            eprintln!("Can't find {} file", slug);
+            continue;
+        }
+        tasks.push(DomainTask {
+            name: slug.into(),
+            fasta_path: fasta_path.to_string_lossy().into_owned(),
+            output_ext: format!("{}.bloom", slug),
+        });
+    }
 
     if tasks.is_empty() {
         eprintln!("No domains specified.");
@@ -98,7 +124,7 @@ pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
     }
 
     for task in tasks {
-        build_single_domain(&task, &scanner, &config.db_prefix, config.fpr)?;
+        build_single_domain(&task, &scanner, &db_prefix, config.fpr)?;
     }
 
     eprintln!(
