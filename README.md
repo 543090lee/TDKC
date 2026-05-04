@@ -16,6 +16,10 @@
 [Paper](https://github.com/543090lee/TDKC) · [Getting Started](#quick-start) · [Citation](#citation)
 
 </div>
+---
+
+## 📢 News & Updates
+* **[Under Development]** I am working on an even faster version of TDKC featuring multithreaded gzip decompression. This upcoming release is specifically optimized to handle massive clinical diagnostic reads with maximum efficiency. Stay tuned!
 
 ---
 ## Installation
@@ -79,8 +83,7 @@ tdkc prep \
 
 ### 2. Build
 
-Distill the target k-mer index. Just point `build` at the prep directory — it picks up taxonomy, targets, prelim map, target FASTA, and all per-domain background FASTAs automatically.
-
+Distill the target k-mer index. 
 ```bash
 tdkc build \
   --db tdkc_db/ \
