@@ -140,6 +140,7 @@ Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 | `-g` | `2` | Min distinct minimizer hit groups |
 | `-a` | off | Output per-read accession hits (requires TDKC-A db) |
 | `-b` | off | Enable domain-level detection (requires built bloom filters) |
+| `-p` | `1` | Penalty applied to domain hit group prevent FP read classifications |
 
 ---
 

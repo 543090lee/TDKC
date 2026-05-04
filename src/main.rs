@@ -73,7 +73,7 @@ enum Commands {
         #[arg(short = '1', long, required_unless_present = "input_dir")]
         read1: Option<String>,
 
-        #[arg(short = '2', long)]
+        #[arg(short = '2', long, requires = "read1")]
         read2: Option<String>,
 
         #[arg(short = 'i', long, required_unless_present = "read1")]
@@ -96,6 +96,9 @@ enum Commands {
 
         #[arg(long, help = "only generates .report")]
         no_output: bool,
+
+        #[arg(short = 'p', long, default_value_t = 1, requires = "background")]
+        domain_penalty: usize,
     },
 
     BuildDomain {
@@ -200,7 +203,8 @@ async fn main() -> anyhow::Result<()> {
             minimum_hit_groups,
             output_prefix,
             background,
-            no_output
+            no_output,
+            domain_penalty
         } => {
             let mut samples = Vec::new();
             if let Some(dir_path) = input_dir {
@@ -236,7 +240,8 @@ async fn main() -> anyhow::Result<()> {
                 minimum_hit_groups,
                 output_prefix,
                 background,
-                no_output
+                no_output,
+                domain_penalty
             })?;
         }
 

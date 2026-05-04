@@ -21,6 +21,7 @@ pub struct QueryConfig {
     pub minimum_hit_groups: usize,
     pub output_prefix: String,
     pub no_output: bool,
+    pub domain_penalty: usize,
 }
 
 pub struct FlatBatch {
@@ -174,7 +175,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 config.minimum_hit_groups,
                 is_paired,
                 &bg_filters,
-                config.no_output
+                config.no_output,
+                config.domain_penalty,
             );
             let _ = writer_tx.send(result);
         });
@@ -241,6 +243,7 @@ fn classify_batch(
     is_paired: bool,
     bg_filters: &[(DomainBloomFilter, u32)],
     no_output: bool,
+    domain_penalty: usize,
 ) -> BatchResult {
     let batch_len = batch.batch1.offsets.len();    
     let mut local_output: Vec<u8> = if no_output { Vec::new() } else { Vec::with_capacity(batch_len * 200) };
@@ -320,7 +323,7 @@ fn classify_batch(
             process_hits(&hits2, &minimizer_buf2); // this is for r2
         }
 
-        let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, 1);
+        let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, domain_penalty);
 
         //Unclassified
         if valid_hits == 0 || effective_hit_groups < min_hit_groups {
