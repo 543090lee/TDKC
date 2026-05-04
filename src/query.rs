@@ -1,3 +1,4 @@
+pub mod read_finder;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::fs::File;
@@ -8,8 +9,8 @@ use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
 use itertools::Itertools;
 use crate::utils::init_thread_pool;
-use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, resolve_domain_lca};
-use crate::read_finder::Sample;
+use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, TAXID_ROOT, TAXID_CELLULAR};
+use read_finder::Sample;
 
 pub struct QueryConfig {
     pub db_prefix: String,
@@ -44,9 +45,9 @@ struct BatchResult {
 
 pub fn run_query(config: QueryConfig) -> Result<()> {
     init_thread_pool(config.threads);
-
+    
     let db = KmerDatabase::load(&config.db_prefix, config.use_accessions)?;
-
+    
     let mut bg_filters = Vec::new();
     if config.background {
         let domains = [
@@ -281,7 +282,6 @@ fn classify_batch(
 
         let mut valid_hits: usize = 0;
         let mut taxid_counts = [0u32; 256];
-        let mut bg_counts = FxHashMap::default();
         let mut target_hit_groups: usize = 0;
         let mut bg_hit_groups: usize = 0;
 
@@ -301,7 +301,9 @@ fn classify_batch(
                     }
                 } else if hit.bg_taxid != 0 {
                     valid_hits += 1;
-                    *bg_counts.entry(hit.bg_taxid).or_default() += 1;
+                    if let Some(domain_idx) = db.get_taxid_index(hit.bg_taxid) {
+                        taxid_counts[domain_idx as usize] += 1;
+                    }
                     if idx < minimizer_buf.len() {
                         let m = minimizer_buf[idx];
                         if m != last_minimizer {
@@ -366,22 +368,9 @@ fn classify_batch(
                     }
                 }
             }
-
-            let mut best_bg_taxids: Vec<u32> = Vec::new();
-            let mut best_bg_count: u32 = 0;
-            for (&taxid, &count) in &bg_counts {
-                if count > best_bg_count {
-                    best_bg_count = count;
-                    best_bg_taxids.clear();
-                    best_bg_taxids.push(taxid);
-                } else if count == best_bg_count {
-                    best_bg_taxids.push(taxid);
-                }
-            }
-
+            
             // tie breaker
-            if max_target_weight >= best_bg_count && max_target_weight > 0 {
-                
+            if max_target_weight > 0 {
                 let mut resolved_taxid_idx: Option<u8> = None;
                 
                 if best_target_nodes.len() == 1 {
@@ -389,6 +378,9 @@ fn classify_batch(
                 } else if best_target_nodes.len() > 1 {
                     // Doing LCA here, but LCA must be an ancestor all tied nodes
                     let mut candidate_lcas = Vec::new();
+
+                    let is_bg_on = !bg_filters.is_empty();
+
                     for k in 0..n {
                         let mut is_common = true;
                         for &s in &best_target_nodes {
@@ -398,6 +390,12 @@ fn classify_batch(
                             }
                         }
                         if is_common {
+                            if !is_bg_on {
+                                let taxid = db.true_taxid(k as u8);
+                                if matches!(taxid, TAXID_ROOT | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI | TAXID_VIRAL | TAXID_CELLULAR) {
+                                    continue;
+                                }
+                            }
                             candidate_lcas.push(k as u8);
                         }
                     }
@@ -442,27 +440,6 @@ fn classify_batch(
                     *local_report.entry(u32::MAX).or_default() += 1; 
                     local_ambiguous += 1;
                 }
-                
-            } else if best_bg_count > 0 {
-                let final_bg_taxid = if best_bg_taxids.len() == 1 {
-                    best_bg_taxids[0]
-                } else {
-                    resolve_domain_lca(best_bg_taxids.iter())
-                };
-
-                // background classified
-                if !no_output {
-                    write_prefix(&mut local_output, "C", &final_bg_taxid);
-                    write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                    if has_r2 {
-                        local_output.extend_from_slice(b" |:| ");
-                        write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
-                    }
-                    local_output.push(b'\n');
-                }
-                
-                *local_report.entry(final_bg_taxid).or_default() += 1;
-                local_classified += 1;
             }
         }
     }

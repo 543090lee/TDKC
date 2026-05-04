@@ -2,15 +2,12 @@ mod build;
 mod database;
 mod minimizer;
 mod prep;
-mod prep_download; 
-mod prep_pipeline; 
 mod query;
 mod taxonomy;
 mod utils;
 mod build_domain;
 mod compression;
 mod hash;
-mod read_finder;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -209,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(dir_path) = input_dir {
                 std::fs::create_dir_all(&output_prefix)?;
 
-                samples = read_finder::discover_samples(std::path::Path::new(&dir_path))?;
+                samples = query::read_finder::discover_samples(std::path::Path::new(&dir_path))?;
                 let paired = samples.iter().filter(|s| s.r2.is_some()).count();
                 let single = samples.len() - paired;
                 eprintln!("Detected {} paired-end reads and {} single-end reads", paired, single);
@@ -220,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
                     .to_string_lossy();
                 
-                samples.push(read_finder::Sample {
+                samples.push(query::read_finder::Sample {
                     name: "read".to_string(),
                     r1: std::path::PathBuf::from(r1),
                     r2: read2.map(std::path::PathBuf::from),

@@ -11,7 +11,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::prep_download::{stream_gz, stream_raw, stream_local_raw, stream_local_gz, with_retry, Backend};
+use super::download::{stream_gz, stream_raw, stream_local_raw, stream_local_gz, with_retry, Backend};
 
 // Gotta stream the file and split at record boundaries when chunk size exceeds the threshold,
 // otherwise, dustmasking windows will break

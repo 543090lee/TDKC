@@ -1,12 +1,14 @@
+mod download;
+mod pipeline;
 use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::{Context, Result};
-use crate::prep_download::{self, BackendKind};
-use crate::prep_pipeline::{self, GenomeSource, PipelineConfig};
 use crate::taxonomy::{load_target_taxids, TargetTaxIDManager, TaxonomyTree};
 use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use download::*;
+use pipeline::*;
 
 pub struct PrepConfig {
     pub domains: String,
@@ -26,9 +28,9 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         .await
         .context("Failed to create output genome directory")?;
 
-    let backend = prep_download::make_backend(BackendKind::Http)?;
+    let backend = make_backend(BackendKind::Http)?;
 
-    let tax_paths = prep_download::download_taxdump(backend.as_ref(), &out_dir).await?;
+    let tax_paths = download_taxdump(backend.as_ref(), &out_dir).await?;
 
     
     let nodes_path = tax_paths.nodes_dmp.to_string_lossy();
@@ -41,7 +43,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     
     eprintln!("Found {} target taxids in the tree.", relevant_taxids.len());
 
-    let (shared_writers, shared_handles) = prep_pipeline::SharedWriters::new(&out_dir)?;
+    let (shared_writers, shared_handles) = SharedWriters::new(&out_dir)?;
 
     let mut domain_list: Vec<String> = cfg.domains.split(',')
         .map(|s| s.trim().to_lowercase())
@@ -52,7 +54,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         domain_list.push("univec_core".to_string());
     }
 
-    let mut total_stats = prep_pipeline::PipelineStats::default();
+    let mut total_stats = PipelineStats::default();
 
     for domain in &domain_list {
         eprintln!("\nProcessing Domain: {}", domain);
@@ -61,7 +63,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
 
         //univec is always downloaded
         if domain == "univec" || domain == "univec_core" {
-            let meta = prep_download::resolve_univec(domain);
+            let meta = resolve_univec(domain);
             
             sources.push(GenomeSource {
                 fetch_path: meta.fetch_path,
@@ -72,7 +74,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             
         } else {
             // Standard RefSeq 
-            let entries = prep_download::fetch_assembly_summary(backend.as_ref(), domain).await?;
+            let entries = fetch_assembly_summary(backend.as_ref(), domain).await?;
             
             for entry in entries {
                 match entry.fna_gz_path() {
@@ -102,7 +104,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             custom_map: None,
         };
 
-        let stats = prep_pipeline::run_pipeline(pipeline_cfg, sources).await?;
+        let stats = pipeline::run_pipeline(pipeline_cfg, sources).await?;
         
         total_stats.genomes_processed += stats.genomes_processed;
         total_stats.records_processed += stats.records_processed;
@@ -125,7 +127,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             }
         }
 
-        let custom_map = prep_download::fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
+        let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
 
         let custom_source = GenomeSource {
             fetch_path: custom_path.clone(),
@@ -147,15 +149,15 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             custom_map: Some(Arc::new(custom_map)), 
         };
 
-        let stats = prep_pipeline::run_pipeline(pipeline_cfg, vec![custom_source]).await?;
+        let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;
         
         total_stats.genomes_processed += stats.genomes_processed;
         total_stats.records_in_target += stats.records_in_target;
         domain_list.push("custom".to_string());
     }
 
-    prep_pipeline::finalize_target_fasta(&out_dir, &domain_list).await?;
-    prep_pipeline::finalize_shared(shared_writers, shared_handles).await?;
+    finalize_target_fasta(&out_dir, &domain_list).await?;
+    finalize_shared(shared_writers, shared_handles).await?;
 
     eprintln!("Prep is done!");
     eprintln!("Total target accessions: {}", total_stats.records_in_target);

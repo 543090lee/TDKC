@@ -51,6 +51,9 @@ tdkc prep \
   -t data/targets.txt \
   -o prep_output/
 ```
+</details>
+
+> **Tip:** When making your own target list, it's recommended to put genus-level target taxID along with species-level. Many k-mers get pushed up due to conserved regions.
 
 **Adding a user-supplied FASTA (GenBank / WGS)**
 

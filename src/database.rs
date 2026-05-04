@@ -437,6 +437,11 @@ impl KmerDatabase {
         }
     }
 
+    #[inline(always)]
+    pub fn get_taxid_index(&self, taxid: u32) -> Option<u8> {
+        self.index_to_taxid.iter().position(|&t| t == taxid).map(|p| p as u8)
+    }
+
     pub fn get_taxid_name(&self, taxid: u32) -> String {
         if taxid == u32::MAX {
             return "\t".to_string();
@@ -738,4 +743,3 @@ pub struct Hit {
     pub is_hit: bool,
     pub bg_taxid: u32, 
 }
-

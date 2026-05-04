@@ -192,7 +192,18 @@ fn build_database_from_shards(
             num_minimizers += 1;
         }
     }
-
+    let core_domains = [
+        crate::taxonomy::TAXID_ROOT,
+        crate::taxonomy::TAXID_CELLULAR,
+        crate::taxonomy::TAXID_BACTERIA,
+        crate::taxonomy::TAXID_ARCHAEA,
+        crate::taxonomy::TAXID_FUNGI,
+        crate::taxonomy::TAXID_VIRAL,
+    ];
+    for &domain in &core_domains {
+        unique_taxids.insert(domain);
+    }
+    
     eprintln!("Found {} unique taxIDs", unique_taxids.len());
     eprintln!("{} unique minimizers", num_minimizers);
 
