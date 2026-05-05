@@ -205,7 +205,7 @@ where
                     break;
                 }
                 eprintln!(
-                    "  [retry] {} attempt {}/{} failed: {:#}; sleeping {:?}",
+                    "[retry] {} attempt {}/{} failed: {:#}; sleeping {:?}",
                     label, attempt, max_attempts, e, delay
                 );
                 tokio::time::sleep(delay).await;

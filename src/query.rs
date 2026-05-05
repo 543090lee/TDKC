@@ -1,6 +1,6 @@
 pub mod read_finder;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Write, BufReader};
 use std::fs::File;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -11,6 +11,7 @@ use itertools::Itertools;
 use crate::utils::init_thread_pool;
 use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, TAXID_ROOT, TAXID_CELLULAR};
 use read_finder::Sample;
+use std::process::{Command, Stdio};
 
 pub struct QueryConfig {
     pub db_dir: String,
@@ -21,6 +22,7 @@ pub struct QueryConfig {
     pub minimum_hit_groups: usize,
     pub output_prefix: String,
     pub no_output: bool,
+    pub gzip_multithreaded: bool,
     pub domain_penalty: usize,
 }
 
@@ -156,9 +158,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
         let reader_handle = std::thread::spawn(move || -> Result<()> {
             if let Some(ref r2_path_str) = r2_path {
-                read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx)?;
+                read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx, config.gzip_multithreaded)?;
             } else {
-                read_single_batches(&r1_path, batch_size, &batch_tx)?;
+                read_single_batches(&r1_path, batch_size, &batch_tx, config.gzip_multithreaded)?;
             }
             // sender is done, so done reading (EOF)
             drop(batch_tx); 
@@ -514,8 +516,13 @@ fn emit_run(
     let _ = write!(out, "{}:{} ", taxid, run_len);
 }
 
-fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>) -> Result<()> {
-    let mut r1_reader = open_fastx(r1_path)?;
+fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
+    let mut r1_reader = if !gzip_multithreaded { 
+        open_fastx(r1_path)? 
+    } else {
+        open_fastx_fast(r1_path)?
+    };
+
     loop {
         let recs1 = read_flat_batch(&mut r1_reader, batch_size)?;
         if recs1.offsets.is_empty() { break; }
@@ -524,13 +531,18 @@ fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel:
     Ok(())
 }
 
-fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>) -> Result<()> {
+fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
     let (r2_tx, r2_rx) = crossbeam_channel::bounded::<Option<FlatBatch>>(4);
     let r2_path_owned = r2_path.to_string();
     let bs = batch_size;
 
     let r2_handle = std::thread::spawn(move || -> Result<()> {
-        let mut r2_reader = open_fastx(&r2_path_owned)?;
+        let mut r2_reader = if !gzip_multithreaded {
+            open_fastx(&r2_path_owned)?
+        } else {
+            open_fastx_fast(&r2_path_owned)?
+        };
+
         loop {
             let recs2 = read_flat_batch(&mut r2_reader, bs)?;
             if recs2.offsets.is_empty() {
@@ -542,7 +554,11 @@ fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &cro
         Ok(())
     });
 
-    let mut r1_reader = open_fastx(r1_path)?;
+    let mut r1_reader = if !gzip_multithreaded {
+        open_fastx(r1_path)?
+    } else {
+        open_fastx_fast(r1_path)?
+    };
     loop {
         let recs1 = read_flat_batch(&mut r1_reader, batch_size)?;
         if recs1.offsets.is_empty() { break; }
@@ -572,6 +588,30 @@ fn open_fastx(path: &str) -> Result<FastxReader> {
         .map_err(|e| anyhow::anyhow!("Cannot open reads file {}", e))?;
     Ok(reader)
 }
+
+fn open_fastx_fast(path: &str) -> Result<FastxReader> {
+    if path.ends_with(".gz") {
+        let mut child = Command::new("rapidgzip")
+            .args(["-d", "-c", "-P", "3", path])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("is rapidgzip installed?: {}", e))?;
+        
+        let stdout = child.stdout.take().unwrap();
+        
+        let buf_reader = BufReader::with_capacity(4 * 1024 * 1024, stdout);
+        
+        let reader = needletail::parse_fastx_reader(buf_reader)
+            .map_err(|e| anyhow::anyhow!("Cannot parse the stream: {}", e))?;
+        
+        Ok(reader)
+    } else {
+        let reader = needletail::parse_fastx_file(path)
+            .map_err(|e| anyhow::anyhow!("Cannot open reads file {}", e))?;
+        Ok(reader)
+    }
+}
+
 fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
     
     let mut data = Vec::with_capacity(n * 250);

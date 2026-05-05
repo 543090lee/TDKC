@@ -97,6 +97,9 @@ enum Commands {
         #[arg(long, help = "only generates .report")]
         no_output: bool,
 
+        #[arg(short = 'f', long, requires = "no_output")]
+        fast_gzip_decompression: bool,
+
         #[arg(short = 'p', long, default_value_t = 1, requires = "background")]
         domain_penalty: usize,
     },
@@ -204,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             output_prefix,
             background,
             no_output,
+            fast_gzip_decompression,
             domain_penalty
         } => {
             let mut samples = Vec::new();
@@ -241,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
                 output_prefix,
                 background,
                 no_output,
+                gzip_multithreaded: fast_gzip_decompression,
                 domain_penalty
             })?;
         }
