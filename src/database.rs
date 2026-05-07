@@ -454,6 +454,10 @@ impl KmerDatabase {
         }
         "Unknown".to_string()
     }
+    
+    pub fn taxid_indices(&self) -> &[u8] {
+        &self.taxid_indices
+    }
 
     pub fn query_into(
         &self,

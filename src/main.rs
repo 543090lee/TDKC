@@ -8,6 +8,7 @@ mod utils;
 mod build_domain;
 mod compression;
 mod hash;
+mod inspect;
 use clap::{Parser, Subcommand};
 use anyhow::Context;
 
@@ -126,6 +127,15 @@ enum Commands {
         #[arg(long)]
         fungi: bool,
     },
+
+    Inspect {
+        #[arg(short = 'd', long)]
+        db: String,
+
+        #[arg(short = 'o', long, default_value = "inspect.txt")]
+        output: String,
+    },
+
 }
 
 #[tokio::main]
@@ -267,6 +277,13 @@ async fn main() -> anyhow::Result<()> {
                 archaea,
                 viral,
                 fungi,
+            })?;
+        }
+
+        Commands::Inspect { db, output } => {
+            inspect::run_inspect(inspect::InspectConfig {
+                db_dir: db,
+                output,
             })?;
         }
     }
