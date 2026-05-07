@@ -176,6 +176,18 @@ Activate at query time with `-b` to classify against broad domains too.
 
 ---
 
+### Inspect TDKC Database
+
+Inspect pre-built TDKC database to analyze k-mer compositions of targets
+
+```bash
+tdkc inspect --db tdkc_db/ 
+```
+
+This will output inspect.txt with number of minimizers each taxID has and its ratio.
+
+---
+
 ## Citation
 
 ```bibtex
