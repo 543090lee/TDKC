@@ -106,6 +106,8 @@ You can find an example `targets.txt` in the `data/` directory of this repo. The
 
 ### 3. Query
 
+#### Default Classification
+
 Query a single sample:
 
 ```bash
@@ -131,6 +133,27 @@ TDKC auto-detects reads in the directory and processes them sequentially. Output
 
 Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 
+#### Subtype Classification
+
+If you would like to also classify which specific subtype/strain the sample has,  make sure you built the database with accession tracking (-a).
+
+Query with `-a`, `-c` flags:
+
+```bash
+tdkc query \
+  --db tdkc_db/ \
+  -1 sample_R1.fastq.gz \
+  -2 sample_R2.fastq.gz \
+  -j 32 \
+  -o results/sample \
+  -a -c
+```
+
+Using these flags provides detailed strain-level information:
+* `-a`: Includes the per k-mer set of accession hits in .output file
+* `-c`: Generate `results/sample.strain.txt` summary file that includes the per-accession total and unique hit counts for the entire sample
+
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-d` / `--db` | — | Database directory |
@@ -138,10 +161,13 @@ Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 | `-2` | — | R2 FASTQ (optional, for paired-end) |
 | `-i` | — | Input directory of FASTQ files (alternative to `-1`/`-2`) |
 | `-g` | `2` | Min distinct minimizer hit groups |
-| `-a` | off | Output per-read accession hits (requires TDKC-A db) |
+| `-a` | off | Output per k-mer accession hits |
 | `-b` | off | Enable domain-level detection (requires built bloom filters) |
 | `-p` | `1` | Penalty applied to domain hit group prevent FP read classifications |
 | `-f` | off | Enable multithreaded gzip decompression. Recommended for short-read (50-100bp) |
+| `-c` | off | Output per-accession total and unique hit counts to .strain.txt |
+| `--no-output` | off | only generates .report |
+
 
 
 ---
