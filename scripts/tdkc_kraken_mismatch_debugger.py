@@ -12,7 +12,6 @@ def main():
     target = args.taxid
     tdkc_data = {}
 
-    print("Step 1: Loading unsorted TDKC data into memory (this might take a moment for large files)...")
     with open(args.tdkc, 'r') as f_tdkc:
         for line in f_tdkc:
             parts = line.strip("\n").split('\t')
@@ -23,9 +22,6 @@ def main():
             taxid = parts[2]
             lca = parts[4]
             tdkc_data[read_id] = (taxid, lca)
-
-    print(f"Loaded {len(tdkc_data)} reads from TDKC.")
-    print("Step 2: Scanning Kraken2 data and cross-referencing...")
 
     with open(args.kraken, 'r') as f_krak, open(args.output, 'w') as f_out:
         f_out.write("Discordance_Type\tRead_ID\tKraken_TaxID\tTDKC_TaxID\tKraken_LCA\tTDKC_LCA\n")
