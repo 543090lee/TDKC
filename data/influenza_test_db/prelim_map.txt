@@ -1,0 +1,2 @@
+accession	taxid
+NC_026431.1	641809
