@@ -7,6 +7,8 @@
 ### Target Distilled K-mer Classifier: Ultrafast and Memory-Efficient Metagenomic Sequence Classification for Target Pathogen Diagnostics
 
 [![Build](https://github.com/543090lee/TDKC/actions/workflows/rust.yml/badge.svg)](https://github.com/543090lee/TDKC/actions/workflows/rust.yml)
+[![Tests](https://github.com/543090lee/TDKC/actions/workflows/query-tests.yml/badge.svg)](https://github.com/543090lee/TDKC/actions/workflows/query-tests.yml)
+[![Release](https://github.com/543090lee/TDKC/actions/workflows/release.yml/badge.svg)](https://github.com/543090lee/TDKC/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 [![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://github.com/543090lee/TDKC)
