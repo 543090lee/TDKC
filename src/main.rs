@@ -103,6 +103,9 @@ enum Commands {
 
         #[arg(short = 'p', long, default_value_t = 1, requires = "background")]
         domain_penalty: usize,
+
+        #[arg(short = 'c', long = "counts", requires = "accession")]
+        counts: bool,
     },
 
     BuildDomain {
@@ -218,7 +221,8 @@ async fn main() -> anyhow::Result<()> {
             background,
             no_output,
             fast_gzip_decompression,
-            domain_penalty
+            domain_penalty,
+            counts,
         } => {
             let mut samples = Vec::new();
             if let Some(dir_path) = input_dir {
@@ -230,11 +234,6 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Detected {} paired-end reads and {} single-end reads", paired, single);
                 
             } else if let Some(r1) = read1 {
-                let file_name = std::path::Path::new(&r1)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                
                 samples.push(query::read_finder::Sample {
                     name: "read".to_string(),
                     r1: std::path::PathBuf::from(r1),
@@ -256,7 +255,8 @@ async fn main() -> anyhow::Result<()> {
                 background,
                 no_output,
                 gzip_multithreaded: fast_gzip_decompression,
-                domain_penalty
+                domain_penalty,
+                counts,
             })?;
         }
 

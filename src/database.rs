@@ -218,7 +218,6 @@ impl EqClassAccessions {
         self.build_rank_cache();
     }
 
-    // input MPHF index and looks up the eqclass ID, and none if no minimizer
     #[inline]
     pub fn get_class_id(&self, idx: usize) -> Option<u32> {
         if !self.has_bit(idx) {
@@ -226,6 +225,21 @@ impl EqClassAccessions {
         }
         let dense_pos = self.rank(idx);
         Some(self.dense_ids[dense_pos])
+    }
+
+    // get_class_id, but also returns the dense position 
+    #[inline]
+    pub fn get_class_id_with_pos(&self, idx: usize) -> Option<(u32, u32)> {
+        if !self.has_bit(idx) {
+            return None;
+        }
+        let dense_pos = self.rank(idx);
+        Some((self.dense_ids[dense_pos], dense_pos as u32))
+    }
+
+    #[inline]
+    pub fn num_dense(&self) -> usize {
+        self.dense_ids.len()
     }
 
     // this is class ID to actual accession IDs
@@ -437,6 +451,11 @@ impl KmerDatabase {
         }
     }
 
+    #[inline]
+    pub fn accessions_ref(&self) -> Option<&EqClassAccessions> {
+        self.accessions.as_ref()
+    }
+
     #[inline(always)]
     pub fn get_taxid_index(&self, taxid: u32) -> Option<u8> {
         self.index_to_taxid.iter().position(|&t| t == taxid).map(|p| p as u8)
@@ -475,14 +494,21 @@ impl KmerDatabase {
         let mut last_m = u64::MAX;
         let mut last_hit = Hit { 
             taxid_idx: 0, 
-            accession_class_id: None, 
+            accession_class_id: None,
+            accession_dense_pos: None,
             is_hit: false, 
             bg_taxid: 0 
         };
 
         for &m in minimizer_buf.iter() {
             if m == u64::MAX {
-                out.push(Hit { taxid_idx: 0, accession_class_id: None, is_hit: false, bg_taxid: 0 });
+                out.push(Hit {
+                    taxid_idx: 0,
+                    accession_class_id: None,
+                    accession_dense_pos: None,
+                    is_hit: false,
+                    bg_taxid: 0,
+                });
                 last_m = u64::MAX;
                 continue;
             }
@@ -505,9 +531,14 @@ impl KmerDatabase {
             }
 
             let new_hit = if is_hit {
+                let (class_id_opt, dense_pos_opt) = match acc_ref.and_then(|a| a.get_class_id_with_pos(hit_idx)) {
+                    Some((cid, dp)) => (Some(cid), Some(dp)),
+                    None => (None, None),
+                };
                 Hit {
                     taxid_idx: self.taxid_indices[hit_idx],
-                    accession_class_id: acc_ref.and_then(|a| a.get_class_id(hit_idx)),
+                    accession_class_id: class_id_opt,
+                    accession_dense_pos: dense_pos_opt,
                     is_hit: true,
                     bg_taxid: 0,
                 }
@@ -532,7 +563,8 @@ impl KmerDatabase {
 
                 Hit { 
                     taxid_idx: 0, 
-                    accession_class_id: None, 
+                    accession_class_id: None,
+                    accession_dense_pos: None,
                     is_hit: false, 
                     bg_taxid 
                 }
@@ -733,17 +765,13 @@ impl DomainBloomFilter {
         let mut reader = BufReader::new(f);
         bincode::deserialize_from(&mut reader).map_err(Into::into)
     }
-
-    // pub fn estimated_fpr(&self) -> f64 {
-    //     let fill = self.popcount() as f64 / self.num_bits as f64;
-    //     fill.powf(self.num_hashes as f64)
-    // }
 }
 
 #[derive(Clone, Copy)]
 pub struct Hit {
     pub taxid_idx: u8,
     pub accession_class_id: Option<u32>,
+    pub accession_dense_pos: Option<u32>,
     pub is_hit: bool,
     pub bg_taxid: u32, 
 }

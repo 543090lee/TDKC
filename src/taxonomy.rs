@@ -233,7 +233,6 @@ pub fn lookup_names(
     }
     let file = File::open(names_dmp_path)?;
     let reader = io::BufReader::new(file);
-    let mut found = 0;
 
     for line in reader.lines() {
         let line = line?;
@@ -243,11 +242,10 @@ pub fn lookup_names(
         let taxid: u32 = parts[0].trim().parse().unwrap_or(0);
         let name = parts[1].trim();
         // the 4th column has the class, and we want "scientific name"
-        let name_class = parts[3].replace("\t|", "").trim().to_string();
+        let name_class = parts[3].trim_end_matches("\t|").trim();
 
         if name_class == "scientific name" && db_taxids.contains(&taxid) {
             writeln!(out_file, "{}\t{}", taxid, name)?;
-            found += 1;
         }
     }
     Ok(())

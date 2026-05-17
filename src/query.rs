@@ -2,6 +2,8 @@ pub mod read_finder;
 use std::collections::HashMap;
 use std::io::{self, Write, BufReader};
 use std::fs::File;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
 use crate::database::{AccessionRegistry, DomainBloomFilter, KmerDatabase, Hit};
@@ -24,6 +26,7 @@ pub struct QueryConfig {
     pub no_output: bool,
     pub gzip_multithreaded: bool,
     pub domain_penalty: usize,
+    pub counts: bool,
 }
 
 pub struct FlatBatch {
@@ -36,10 +39,36 @@ pub struct ReadBatch {
     pub batch2: Option<FlatBatch>,
 }
 
+type AccCountMap = FxHashMap<u32, (u32, u32)>;
+struct SeenBitset {
+    words: Vec<AtomicU64>,
+}
+
+impl SeenBitset {
+    fn new(num_dense: usize) -> Self {
+        let num_words = (num_dense + 63) / 64;
+        let mut words = Vec::with_capacity(num_words);
+        for _ in 0..num_words {
+            words.push(AtomicU64::new(0));
+        }
+        Self { words }
+    }
+
+    // Set the bit then returns true iff this thread was the one that flipped 0 to 1
+    #[inline]
+    fn test_and_set(&self, dense_pos: u32) -> bool {
+        let word = (dense_pos as usize) / 64;
+        let bit = 1u64 << ((dense_pos as u64) % 64);
+        let prev = self.words[word].fetch_or(bit, Ordering::Relaxed);
+        prev & bit == 0
+    }
+}
+
 // this goes to writer thread
 struct BatchResult {
     output_data: Vec<u8>,
     report_counts: FxHashMap<u32, usize>,
+    acc_counts: AccCountMap,
     classified: usize,
     unclassified: usize,
     ambiguous: usize,
@@ -51,7 +80,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     let db_prefix = format!("{}/db", config.db_dir);
     let db = KmerDatabase::load(&db_prefix, config.use_accessions)?;
-    
+
     let mut bg_filters = Vec::new();
     if config.background {
         let domains = [
@@ -86,6 +115,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         None
     };
 
+    if config.counts && (acc_registry.is_none() || db.accessions_ref().is_none()) {
+        anyhow::bail!("--counts requires an accession database");
+    }
+
     let scanner = MinimizerScanner::new(db.k(),db.l(),db.spaced_seed_mask,db.toggle_mask);
     let classify_start = std::time::Instant::now();
     let num_samples = config.samples.len();
@@ -94,8 +127,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     for sample in config.samples {
         let is_paired = sample.r2.is_some();
         let r1_path = sample.r1.to_string_lossy().to_string();
-        let r2_path = sample.r2.as_ref().map(|p| p.to_string_lossy().to_string());   
-        
+        let r2_path = sample.r2.as_ref().map(|p| p.to_string_lossy().to_string());
+
         eprint!("\n>>> Processing sample ");
         let out_prefix = if num_samples == 1 && !std::path::Path::new(&config.output_prefix).is_dir() {
             eprint!("...");
@@ -109,12 +142,19 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let no_output = config.no_output;
         let out_prefix_clone = out_prefix.clone();
 
+        let seen_bits: Option<Arc<SeenBitset>> = if config.counts {
+            db.accessions_ref().map(|acc| Arc::new(SeenBitset::new(acc.num_dense())))
+        } else {
+            None
+        };
+
         // thread only to write, no lock, so less overhead
         // we need sync channels here, since rayon worker threads will be much faster and more, just spitting
         // BatchResults into writer thread, but if we dont have sync channels, rayon threads will just stall...
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
+        let want_counts = config.counts;
         // writer thread will act as a mutex, but without contention
-        let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, usize, usize, usize, usize)> {
+        let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, AccCountMap, usize, usize, usize, usize)> {
             //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
             //when it;s full
             let mut writer = if !no_output {
@@ -122,9 +162,10 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 Some(io::BufWriter::with_capacity(4 * 1024 * 1024, output_file))
             } else {
                 None
-            };            
-            
+            };
+
             let mut global_report: HashMap<u32, usize> = HashMap::new();
+            let mut global_acc_counts: AccCountMap = FxHashMap::default();
             // I could use AtomicUsize for these, since these are single values, but too lazy
             let mut total_c: usize = 0;
             let mut total_u: usize = 0;
@@ -138,6 +179,13 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 for (taxid, count) in batch.report_counts {
                     *global_report.entry(taxid).or_default() += count;
                 }
+                if want_counts {
+                    for (acc_id, (total, uniq)) in batch.acc_counts {
+                        let slot = global_acc_counts.entry(acc_id).or_insert((0, 0));
+                        slot.0 += total;
+                        slot.1 += uniq;
+                    }
+                }
                 total_c += batch.classified;
                 total_u += batch.unclassified;
                 total_a += batch.ambiguous;
@@ -147,7 +195,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             if let Some(ref mut w) = writer {
                 w.flush()?;
             }
-            Ok((global_report, total_c, total_u, total_a, total_n))
+            Ok((global_report, global_acc_counts, total_c, total_u, total_a, total_n))
         });
 
         let batch_size = 5_000;
@@ -163,7 +211,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 read_single_batches(&r1_path, batch_size, &batch_tx, config.gzip_multithreaded)?;
             }
             // sender is done, so done reading (EOF)
-            drop(batch_tx); 
+            drop(batch_tx);
             Ok(())
         });
 
@@ -179,12 +227,13 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 &bg_filters,
                 config.no_output,
                 config.domain_penalty,
+                seen_bits.as_deref(),
             );
             let _ = writer_tx.send(result);
         });
 
         drop(writer_tx);
-        let (global_report, c, u, a, num_records) = match writer_handle.join() {
+        let (global_report, global_acc_counts, c, u, a, num_records) = match writer_handle.join() {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e),
             Err(_) => anyhow::bail!("Writer thread panicked"),
@@ -196,6 +245,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
             Err(_) => anyhow::bail!("Reader thread panicked"),
         }
 
+        // .report
         {
             let f = File::create(format!("{}.report", out_prefix))?;
             let mut writer = io::BufWriter::new(f);
@@ -207,10 +257,33 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 let ratio = if num_records > 0 { *count as f64 / num_records as f64 } else { 0.0 };
                 let taxid_label = if *taxid == u32::MAX { "Ambiguous".to_string() } else { taxid.to_string() };
                 let name = db.get_taxid_name(*taxid);
-                
+
                 writeln!(writer, "{}\t{}\t{}\t{:0.3}", taxid_label, name, count, ratio)?;
             }
             writer.flush()?;
+        }
+
+        // strain.txt
+        if config.counts {
+            if let Some(reg) = acc_registry.as_ref() {
+                let strain_path = format!("{}.strain.txt", out_prefix);
+                let f = File::create(&strain_path)?;
+                let mut writer = io::BufWriter::new(f);
+                writeln!(writer, "Accession\tTotal_Hits\tUnique_Hits")?;
+
+                let mut rows: Vec<(u32, u32, u32)> = global_acc_counts
+                    .into_iter()
+                    .map(|(acc_id, (total, uniq))| (acc_id, total, uniq))
+                    .collect();
+                rows.sort_by(|a, b| {
+                    b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0))
+                });
+
+                for (acc_id, total, uniq) in &rows {
+                    writeln!(writer, "{}\t{}\t{}", reg.get_name(*acc_id), total, uniq)?;
+                }
+                writer.flush()?;
+            }
         }
 
         if c + u + a != num_records {
@@ -246,10 +319,12 @@ fn classify_batch(
     bg_filters: &[(DomainBloomFilter, u32)],
     no_output: bool,
     domain_penalty: usize,
+    seen_bits: Option<&SeenBitset>,
 ) -> BatchResult {
-    let batch_len = batch.batch1.offsets.len();    
+    let batch_len = batch.batch1.offsets.len();
     let mut local_output: Vec<u8> = if no_output { Vec::new() } else { Vec::with_capacity(batch_len * 200) };
     let mut local_report: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut local_acc_counts: AccCountMap = FxHashMap::default();
     let mut local_classified: usize = 0;
     let mut local_unclassified: usize = 0;
     let mut local_ambiguous: usize = 0;
@@ -258,6 +333,28 @@ fn classify_batch(
     let mut hits2: Vec<Hit> = Vec::new();
     let mut minimizer_buf1: Vec<u64> = Vec::new();
     let mut minimizer_buf2: Vec<u64> = Vec::new();
+
+    let acc_ref_for_counts = seen_bits.and_then(|_| db.accessions_ref());
+
+    // Helper that credits an accession-class for the very first time seen
+    let credit_class = |class_id: u32, dense_pos: u32, local_acc_counts: &mut AccCountMap| {
+        let (sb, acc) = match (seen_bits, acc_ref_for_counts) {
+            (Some(sb), Some(acc)) => (sb, acc),
+            _ => return,
+        };
+        if !sb.test_and_set(dense_pos) {
+            return; // some other thread already credited this minimizer
+        }
+        let accs = acc.decode_class(class_id);
+        let is_unique = accs.len() == 1;
+        for &a in &accs {
+            let slot = local_acc_counts.entry(a).or_insert((0, 0));
+            slot.0 = slot.0.saturating_add(1);
+            if is_unique {
+                slot.1 = slot.1.saturating_add(1);
+            }
+        }
+    };
 
     for i in 0..batch_len {
         let (h1_start, h1_end, s1_start, s1_end) = batch.batch1.offsets[i];
@@ -277,6 +374,21 @@ fn classify_batch(
             (0, false)
         };
 
+        if seen_bits.is_some() {
+            for hit in hits1.iter() {
+                if let (Some(cid), Some(dp)) = (hit.accession_class_id, hit.accession_dense_pos) {
+                    credit_class(cid, dp, &mut local_acc_counts);
+                }
+            }
+            if has_r2 {
+                for hit in hits2.iter() {
+                    if let (Some(cid), Some(dp)) = (hit.accession_class_id, hit.accession_dense_pos) {
+                        credit_class(cid, dp, &mut local_acc_counts);
+                    }
+                }
+            }
+        }
+
         let write_prefix = |out: &mut Vec<u8>, status: &str, taxid: &dyn std::fmt::Display| {
             let header_str = unsafe { std::str::from_utf8_unchecked(&header1) };
             if is_paired {
@@ -291,31 +403,24 @@ fn classify_batch(
         let mut target_hit_groups: usize = 0;
         let mut bg_hit_groups: usize = 0;
 
-        // Inline closure to process hits without code duplication
         let mut process_hits = |hits: &[Hit], minimizer_buf: &[u64]| {
             let mut last_minimizer: u64 = u64::MAX;
-            for (idx, hit) in hits.iter().enumerate() {
+            for (hit, &m) in hits.iter().zip(minimizer_buf.iter()) {
                 if hit.is_hit {
                     valid_hits += 1;
                     taxid_counts[hit.taxid_idx as usize] += 1;
-                    if idx < minimizer_buf.len() {
-                        let m = minimizer_buf[idx];
-                        if m != last_minimizer {
-                            target_hit_groups += 1;
-                            last_minimizer = m;
-                        }
+                    if m != last_minimizer {
+                        target_hit_groups += 1;
+                        last_minimizer = m;
                     }
                 } else if hit.bg_taxid != 0 {
                     valid_hits += 1;
                     if let Some(domain_idx) = db.get_taxid_index(hit.bg_taxid) {
                         taxid_counts[domain_idx as usize] += 1;
                     }
-                    if idx < minimizer_buf.len() {
-                        let m = minimizer_buf[idx];
-                        if m != last_minimizer {
-                            bg_hit_groups += 1;
-                            last_minimizer = m;
-                        }
+                    if m != last_minimizer {
+                        bg_hit_groups += 1;
+                        last_minimizer = m;
                     }
                 }
             }
@@ -326,7 +431,7 @@ fn classify_batch(
         }
 
         let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, domain_penalty);
-
+        
         //Unclassified
         if valid_hits == 0 || effective_hit_groups < min_hit_groups {
             if !no_output {
@@ -341,7 +446,7 @@ fn classify_batch(
             local_unclassified += 1;
         } else {
             let n = db.index_to_taxid.len();
-            
+
             let mut active_indices = Vec::new();
             for (idx, &count) in taxid_counts.iter().enumerate() {
                 if count > 0 && idx < n {
@@ -366,19 +471,17 @@ fn classify_batch(
                 }
             }
 
-            let mut best_target_nodes = Vec::new();
+            // tie breaker
             if max_target_weight > 0 {
+                let mut best_target_nodes = Vec::new();
                 for i in 0..n {
                     if path_weights[i] == max_target_weight {
                         best_target_nodes.push(i as u8);
                     }
                 }
-            }
-            
-            // tie breaker
-            if max_target_weight > 0 {
+
                 let mut resolved_taxid_idx: Option<u8> = None;
-                
+
                 if best_target_nodes.len() == 1 {
                     resolved_taxid_idx = Some(best_target_nodes[0]);
                 } else if best_target_nodes.len() > 1 {
@@ -410,7 +513,7 @@ fn classify_batch(
                         let mut lca_idx = candidate_lcas[0];
                         for &c in &candidate_lcas[1..] {
                             if db.is_ancestor(lca_idx, c) {
-                                lca_idx = c; // c is deeper
+                                lca_idx = c;
                             }
                         }
                         resolved_taxid_idx = Some(lca_idx);
@@ -443,7 +546,7 @@ fn classify_batch(
                         }
                         local_output.push(b'\n');
                     }
-                    *local_report.entry(u32::MAX).or_default() += 1; 
+                    *local_report.entry(u32::MAX).or_default() += 1;
                     local_ambiguous += 1;
                 }
             }
@@ -453,6 +556,7 @@ fn classify_batch(
     BatchResult {
         output_data: local_output,
         report_counts: local_report,
+        acc_counts: local_acc_counts,
         classified: local_classified,
         unclassified: local_unclassified,
         ambiguous: local_ambiguous,
@@ -517,8 +621,8 @@ fn emit_run(
 }
 
 fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
-    let mut r1_reader = if !gzip_multithreaded { 
-        open_fastx(r1_path)? 
+    let mut r1_reader = if !gzip_multithreaded {
+        open_fastx(r1_path)?
     } else {
         open_fastx_fast(r1_path)?
     };
@@ -596,14 +700,14 @@ fn open_fastx_fast(path: &str) -> Result<FastxReader> {
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("is rapidgzip installed?: {}", e))?;
-        
+
         let stdout = child.stdout.take().unwrap();
-        
+
         let buf_reader = BufReader::with_capacity(4 * 1024 * 1024, stdout);
-        
+
         let reader = needletail::parse_fastx_reader(buf_reader)
             .map_err(|e| anyhow::anyhow!("Cannot parse the stream: {}", e))?;
-        
+
         Ok(reader)
     } else {
         let reader = needletail::parse_fastx_file(path)
@@ -613,7 +717,7 @@ fn open_fastx_fast(path: &str) -> Result<FastxReader> {
 }
 
 fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
-    
+
     let mut data = Vec::with_capacity(n * 250);
     let mut offsets = Vec::with_capacity(n);
 
@@ -637,6 +741,6 @@ fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
             None => break,
         }
     }
-    
+
     Ok(FlatBatch { data, offsets })
 }
