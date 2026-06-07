@@ -1,4 +1,7 @@
 /target
 *.output
+*.report
+*.strain.txt
 .DS_Store
 TODO.txt
+/my_db

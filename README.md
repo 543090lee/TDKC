@@ -87,9 +87,7 @@ tdkc prep \
 
 Distill the target k-mer index. 
 ```bash
-tdkc build \
-  --db tdkc_db/ \
-  -j 32
+tdkc build --db tdkc_db/ -j 32
 ```
 
 Add `-a` to enable per-minimizer accession tracking (TDKC-A mode).
