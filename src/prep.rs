@@ -17,7 +17,8 @@ pub struct PrepConfig {
     pub backend: String,
     pub concurrent_downloads: usize,
     pub in_flight_chunks: usize,
-    pub custom_fasta: Option<String>, 
+    pub custom_fasta: Option<String>,
+    pub no_mask: bool,
 }
 
 pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
@@ -106,6 +107,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             relevant_taxids: Arc::clone(&relevant_taxids),
             shared: Arc::clone(&shared_writers),
             custom_map: None,
+            no_mask: cfg.no_mask,
         };
 
         let stats = pipeline::run_pipeline(pipeline_cfg, sources).await?;
@@ -150,7 +152,8 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             batch_threshold_bytes: 64 * 1024 * 1024,
             relevant_taxids: Arc::clone(&relevant_taxids),
             shared: Arc::clone(&shared_writers),
-            custom_map: Some(Arc::new(custom_map)), 
+            custom_map: Some(Arc::new(custom_map)),
+            no_mask: cfg.no_mask,
         };
 
         let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;

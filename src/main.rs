@@ -46,6 +46,10 @@ enum Commands {
         /// Optional path to a custom FASTA file to include alongside RefSeq downloads
         #[arg(long)]
         custom: Option<String>,
+
+        /// Skip dustmasker low-complexity masking
+        #[arg(long)]
+        no_mask: bool,
     },
 
     Build {
@@ -154,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             concurrent_downloads,
             in_flight_chunks,
             custom,
+            no_mask,
         } => {
             prep::run_prep(prep::PrepConfig {
                 domains,
@@ -163,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
                 concurrent_downloads,
                 in_flight_chunks,
                 custom_fasta: custom,
+                no_mask,
             }).await?;
         }
 

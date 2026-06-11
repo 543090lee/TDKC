@@ -142,6 +142,7 @@ pub struct PipelineConfig {
     pub relevant_taxids: Arc<HashSet<u32>>,
     pub shared: Arc<SharedWriters>,
     pub custom_map: Option<Arc<FxHashMap<String, u32>>>,
+    pub no_mask: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -188,6 +189,7 @@ pub async fn run_pipeline(
     });
 
     let in_flight_sem = Arc::new(Semaphore::new(cfg.max_in_flight_chunks.max(1)));
+    let no_mask = cfg.no_mask;
     let masker_handle: JoinHandle<Result<u64>> = {
         let sem = Arc::clone(&in_flight_sem);
         tokio::spawn(async move {
@@ -197,7 +199,7 @@ pub async fn run_pipeline(
                     .map_err(|_| anyhow!("semaphore closed"))?;
                 let worker_handle: JoinHandle<Result<MaskedChunk>> =
                     tokio::spawn(async move {
-                        let res = eof_worker(chunk).await;
+                        let res = eof_worker(chunk, no_mask).await;
                         drop(permit);
                         res
                     });
@@ -447,7 +449,23 @@ fn rfind_nl_gt(buf: &[u8]) -> Option<usize> {
     }
 }
 
-async fn eof_worker(chunk: ByteChunk) -> Result<MaskedChunk> {
+async fn eof_worker(chunk: ByteChunk, no_mask: bool) -> Result<MaskedChunk> {
+    if no_mask {
+        let taxid = chunk.taxid;
+        let assembly = chunk.assembly_accession;
+        let chunk_bytes = chunk.bytes;
+        let parsed = tokio::task::spawn_blocking(move || -> Result<Vec<MaskedRecord>> {
+            parse_masked_fasta(&chunk_bytes)
+        })
+        .await
+        .context("parse_masked_fasta task")??;
+        return Ok(MaskedChunk {
+            records: parsed,
+            taxid,
+            assembly_accession: assembly,
+        });
+    }
+
     let mut child = Command::new("dustmasker")
         .args(["-in", "-", "-outfmt", "fasta"])
         .stdin(Stdio::piped())
