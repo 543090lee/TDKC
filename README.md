@@ -52,7 +52,7 @@ Download reference sequences from NCBI via **HTTPS** (no FTP or rsync), filter t
 
 ```bash
 tdkc prep \
-  --domains bacteria,viral,human,archaea \
+  --domains bacteria,viral,human,archaea,plasmid \
   -t data/targets.txt \
   --db tdkc_db/
 ```
@@ -75,12 +75,14 @@ tdkc prep \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--domains` | `bacteria,viral,archaea,human` | Comma-separated RefSeq domains to download. Valid values: `bacteria`, `viral`, `archaea`, `human`, `fungi`, `invertebrate`, `plant`, `plastid`, `protozoa`. UniVec_Core is always included automatically. |
+| `--domains` | `bacteria,viral,archaea,human` | Comma-separated RefSeq domains to download. Valid values: `bacteria`, `viral`, `archaea`, `human`, `fungi`, `invertebrate`, `plant`, `plasmid`, `protozoa`. UniVec_Core is always included automatically. |
 | `-t` / `--targets` | — | Path to targets file (one NCBI taxid per line, any rank). A copy is saved into the db dir as `targets.txt`. |
 | `-d` / `--db` | `tdkc_db` | Database output directory. This becomes the input for every subsequent command. |
 | `--custom` | — | Path to a local FASTA file to include. |
 | `--concurrent-downloads` | `6` | Number of genome files being streamed from NCBI in parallel. I don't recommend going over 6, NCBI server might complain... |
 | `--in-flight-chunks` | `2` | Number of dust-masking jobs to run in parallel |
+| `--no-mask` | - | Skips dust-masking |
+
 
 
 ### 2. Build
