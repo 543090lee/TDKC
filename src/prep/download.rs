@@ -9,7 +9,7 @@ use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio_util::io::StreamReader;
 
 
@@ -353,15 +353,19 @@ pub async fn fetch_assembly_summary(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let version_status = cols[10].trim();
-        let genome_rep = cols[13].trim();
+        let assembly_level = cols[11].trim();
         let asm_name = cols[15].trim();
         let ftp_path = cols[19].trim();
 
-        if version_status != "latest" || genome_rep != "Full" {
+        // Match Kraken2 (rsync_from_ncbi.pl): keep only Complete Genome /
+        // Chromosome assemblies. Kraken2 does not filter on version_status or
+        // genome_rep, so neither do we.
+        if assembly_level != "Complete Genome" && assembly_level != "Chromosome" {
             continue;
         }
-        if domain == "human" && !asm_name.contains("GRCh") {
+        // Match Kraken2 (download_genomic_library.sh): the human library keeps
+        // only lines mentioning the Genome Reference Consortium submitter.
+        if domain == "human" && !line.contains("Genome Reference Consortium") {
             continue;
         }
         if ftp_path.is_empty() || ftp_path == "na" {
@@ -466,6 +470,95 @@ pub fn resolve_univec(domain: &str) -> UnivecMetadata {
         filename: filename.to_string(),
         taxid: 28384, // I am following the same label as Kraken2, they get special label!
     }
+}
+
+/// Some RefSeq libraries (plasmid, plastid, mitochondrion) have no
+/// assembly_summary.txt; they ship as a numbered set of catalog files like
+/// `plasmid.1.1.genomic.fna.gz`. Kraken2 grabs these with an rsync wildcard;
+/// over HTTP we instead parse the directory listing and pull out every
+/// `<dir>.*.genomic.fna.gz` entry.
+pub async fn list_refseq_catalog_files(
+    backend: &dyn Backend,
+    dir: &str,
+) -> Result<Vec<String>> {
+    let path = format!("/genomes/refseq/{}/", dir);
+    let body = with_retry(&format!("listing[{}]", dir), 5, || async {
+        let (mut rdr, _sha) = stream_raw(backend, &path).await?;
+        let mut s = String::with_capacity(64 * 1024);
+        rdr.read_to_string(&mut s).await
+            .context("reading directory listing")?;
+        Ok(s)
+    })
+    .await?;
+
+    let needle = ".genomic.fna.gz";
+    let prefix = format!("{}.", dir); // e.g. "plasmid."
+    let bytes = body.as_bytes(); // NCBI listings are ASCII, so byte == char index
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for (idx, _) in body.match_indices(needle) {
+        let end = idx + needle.len();
+        // Walk back to the start of the filename token.
+        let mut start = idx;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c == b'"' || c == b'\'' || c == b'>' || c == b'/' {
+                break;
+            }
+            start -= 1;
+        }
+        let name = &body[start..end];
+        if name.starts_with(&prefix) && seen.insert(name.to_string()) {
+            files.push(name.to_string());
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(anyhow!("no {}*.genomic.fna.gz files found in /genomes/refseq/{}/", dir, dir));
+    }
+    Ok(files)
+}
+
+/// Stream a gzipped RefSeq catalog file, decompress it to `local_path`, and
+/// return the accession.version of every record (the first whitespace token of
+/// each `>` header) so taxids can be resolved via accession2taxid.
+pub async fn fetch_and_decompress_to(
+    backend: &dyn Backend,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<Vec<String>> {
+    let local_owned = local_path.to_path_buf();
+    let accs = with_retry(&format!("catalog[{}]", remote_path), 5, || {
+        let local_owned = local_owned.clone();
+        async move {
+            let (rdr, _sha) = stream_gz(backend, remote_path).await?;
+            let mut buffered = BufReader::with_capacity(4 * 1024 * 1024, rdr);
+            let out_file = tokio::fs::File::create(&local_owned).await
+                .with_context(|| format!("create {}", local_owned.display()))?;
+            let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
+
+            let mut accs = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = buffered.read_line(&mut line).await
+                    .with_context(|| format!("reading {}", remote_path))?;
+                if n == 0 {
+                    break;
+                }
+                if line.starts_with('>') {
+                    if let Some(tok) = line[1..].split_whitespace().next() {
+                        accs.push(tok.to_string());
+                    }
+                }
+                writer.write_all(line.as_bytes()).await?;
+            }
+            writer.flush().await?;
+            Ok(accs)
+        }
+    })
+    .await?;
+    Ok(accs)
 }
 
 pub async fn stream_local_raw(path: &str) -> Result<(BoxedReader, ShaHandle)> {

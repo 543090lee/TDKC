@@ -143,6 +143,9 @@ pub struct PipelineConfig {
     pub shared: Arc<SharedWriters>,
     pub custom_map: Option<Arc<FxHashMap<String, u32>>>,
     pub no_mask: bool,
+    /// When a custom_map is present, drop records whose id has no taxid mapping
+    /// instead of emitting them with the fallback taxid (used for plasmid).
+    pub drop_unmapped: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -221,6 +224,7 @@ pub async fn run_pipeline(
     let sink_domain = cfg.domain_name.clone();
 
     let sink_custom_map = cfg.custom_map.clone();
+    let sink_drop_unmapped = cfg.drop_unmapped;
 
     let sink_handle: JoinHandle<Result<PipelineStats>> = tokio::spawn(async move {
         run_sink(
@@ -231,6 +235,7 @@ pub async fn run_pipeline(
             sink_shared,
             sink_domain,
             sink_custom_map,
+            sink_drop_unmapped,
         )
         .await
     });
@@ -587,7 +592,8 @@ async fn run_sink(
     relevant: Arc<HashSet<u32>>,
     shared: Arc<SharedWriters>,
     domain_name: String,
-    custom_map: Option<Arc<FxHashMap<String, u32>>>, 
+    custom_map: Option<Arc<FxHashMap<String, u32>>>,
+    drop_unmapped: bool,
 ) -> Result<PipelineStats> {
     let domain_file = TokioFile::create(&domain_path)
         .await
@@ -612,15 +618,17 @@ async fn run_sink(
         for mut rec in masked.records {
             lowercase_to_x(&mut rec.seq);
 
-            let mut actual_taxid = masked.taxid; 
-            
+            let mut actual_taxid = masked.taxid;
+
             if let Some(cmap) = &custom_map {
-                if let Some(&tid) = cmap.get(&rec.record_id) {
-                    actual_taxid = tid;
+                match cmap.get(&rec.record_id) {
+                    Some(&tid) => actual_taxid = tid,
+                    None if drop_unmapped => continue,
+                    None => {}
                 }
             }
 
-            let is_target = relevant.contains(&actual_taxid); 
+            let is_target = relevant.contains(&actual_taxid);
             
             domain_w.write_all(b">").await?;
             domain_w.write_all(&rec.header).await?;

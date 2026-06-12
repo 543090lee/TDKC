@@ -24,8 +24,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Prep {
-        /// You can download archaea, bacteria, fungi, invertebrate, plants, plastid, protozoa, human, or none 
-        #[arg(long, default_value = "bacteria,viral,archaea,human")]
+        /// You can download archaea, bacteria, viral, fungi, invertebrate, plant, protozoa, human, plasmid, univec_core, or none
+        #[arg(long, default_value = "bacteria,viral,archaea,human,plasmid")]
         domains: String,
 
         #[arg(short = 't', long)]

@@ -65,18 +65,54 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         eprintln!("\nProcessing Domain: {}", domain);
         
         let mut sources = Vec::new();
+        let mut domain_custom_map: Option<Arc<FxHashMap<String, u32>>> = None;
 
         //univec is always downloaded
         if domain == "univec" || domain == "univec_core" {
             let meta = resolve_univec(domain);
-            
+
             sources.push(GenomeSource {
                 fetch_path: meta.fetch_path,
-                gzipped: false, 
+                gzipped: false,
                 taxid: meta.taxid,
                 assembly_accession: meta.filename,
             });
-            
+
+        } else if domain == "plasmid" {
+            // plasmid has no assembly_summary.txt; mirror Kraken2's special case:
+            // download every catalog file, then assign taxids per-sequence via
+            // accession2taxid (there is no per-assembly taxid to inherit).
+            let cache_dir = genome_dir.join(".plasmid_cache");
+            tokio::fs::create_dir_all(&cache_dir).await?;
+
+            let files = list_refseq_catalog_files(backend.as_ref(), "plasmid").await?;
+            eprintln!("  [plasmid] {} catalog files", files.len());
+
+            let mut wanted = std::collections::HashSet::new();
+            for fname in files {
+                let remote = format!("/genomes/refseq/plasmid/{}", fname);
+                let local = cache_dir.join(fname.trim_end_matches(".gz"));
+                let accs =
+                    fetch_and_decompress_to(backend.as_ref(), &remote, &local).await?;
+                for a in accs {
+                    wanted.insert(a);
+                }
+                sources.push(GenomeSource {
+                    fetch_path: local.to_string_lossy().into_owned(),
+                    gzipped: false,
+                    taxid: 0, // resolved per-record from the accession2taxid map below
+                    assembly_accession: fname,
+                });
+            }
+
+            eprintln!(
+                "  [plasmid] resolving taxids for {} sequences via accession2taxid",
+                wanted.len()
+            );
+            let map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
+            eprintln!("  [plasmid] mapped {}/{} accessions", map.len(), wanted.len());
+            domain_custom_map = Some(Arc::new(map));
+
         } else {
             // Standard RefSeq 
             let entries = fetch_assembly_summary(backend.as_ref(), domain).await?;
@@ -106,12 +142,19 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             batch_threshold_bytes: 64 * 1024 * 1024, 
             relevant_taxids: Arc::clone(&relevant_taxids),
             shared: Arc::clone(&shared_writers),
-            custom_map: None,
+            custom_map: domain_custom_map,
             no_mask: cfg.no_mask,
+            // plasmid sequences with no accession2taxid hit are dropped
+            drop_unmapped: domain == "plasmid",
         };
 
         let stats = pipeline::run_pipeline(pipeline_cfg, sources).await?;
-        
+
+        if domain == "plasmid" {
+            // The decompressed catalog files have been re-emitted into plasmid.fna.
+            let _ = tokio::fs::remove_dir_all(genome_dir.join(".plasmid_cache")).await;
+        }
+
         total_stats.genomes_processed += stats.genomes_processed;
         total_stats.records_processed += stats.records_processed;
         total_stats.records_in_target += stats.records_in_target;
@@ -154,6 +197,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             shared: Arc::clone(&shared_writers),
             custom_map: Some(Arc::new(custom_map)),
             no_mask: cfg.no_mask,
+            drop_unmapped: false, // custom FASTA keeps unmapped records (taxid 0)
         };
 
         let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;
