@@ -48,8 +48,6 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     
     eprintln!("Found {} target taxids in the tree.", relevant_taxids.len());
 
-    let (shared_writers, shared_handles) = SharedWriters::new(&out_dir)?;
-
     let mut domain_list: Vec<String> = cfg.domains.split(',')
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty() && s != "none")
@@ -62,8 +60,14 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     let mut total_stats = PipelineStats::default();
 
     for domain in &domain_list {
+        let done_marker = genome_dir.join(format!(".{}.done", domain));
+        if done_marker.exists() {
+            eprintln!("\nDomain '{}' already exists, skipping.", domain);
+            continue;
+        }
+
         eprintln!("\nProcessing Domain: {}", domain);
-        
+
         let mut sources = Vec::new();
         let mut domain_custom_map: Option<Arc<FxHashMap<String, u32>>> = None;
 
@@ -132,6 +136,8 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             }
         }
 
+        let (shared_writers, shared_handles) = SharedWriters::new(&genome_dir, domain)?;
+
         let pipeline_cfg = PipelineConfig {
             domain_name: domain.clone(),
             source_label: format!("refseq:{}", domain),
@@ -139,7 +145,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             backend: Arc::clone(&backend),
             concurrent_downloads: cfg.concurrent_downloads,
             max_in_flight_chunks: cfg.in_flight_chunks,
-            batch_threshold_bytes: 64 * 1024 * 1024, 
+            batch_threshold_bytes: 64 * 1024 * 1024,
             relevant_taxids: Arc::clone(&relevant_taxids),
             shared: Arc::clone(&shared_writers),
             custom_map: domain_custom_map,
@@ -149,6 +155,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         };
 
         let stats = pipeline::run_pipeline(pipeline_cfg, sources).await?;
+        finalize_shared(shared_writers, shared_handles).await?;
 
         if domain == "plasmid" {
             // The decompressed catalog files have been re-emitted into plasmid.fna.
@@ -159,56 +166,70 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         total_stats.records_processed += stats.records_processed;
         total_stats.records_in_target += stats.records_in_target;
         total_stats.chunks_masked += stats.chunks_masked;
+
+        tokio::fs::write(&done_marker, b"")
+            .await
+            .with_context(|| format!("write done marker {}", done_marker.display()))?;
     }
 
     if let Some(custom_path) = &cfg.custom_fasta {
-        eprintln!("\nProcessing custom FASTA: {}", custom_path);
+        let done_marker = genome_dir.join(".custom.done");
+        if done_marker.exists() {
+            eprintln!("\nCustom sequences already added, skipping.");
+        } else {
+            eprintln!("\nProcessing custom FASTA: {}", custom_path);
 
-        let mut wanted = std::collections::HashSet::new();
-        let file = std::fs::File::open(custom_path)?;
-        let reader = std::io::BufReader::new(file);
-        for line in std::io::BufRead::lines(reader) {
-            let l = line?;
-            if l.starts_with('>') {
-                if let Some(acc) = l[1..].split_whitespace().next() {
-                    wanted.insert(acc.to_string());
+            let mut wanted = std::collections::HashSet::new();
+            let file = std::fs::File::open(custom_path)?;
+            let reader = std::io::BufReader::new(file);
+            for line in std::io::BufRead::lines(reader) {
+                let l = line?;
+                if l.starts_with('>') {
+                    if let Some(acc) = l[1..].split_whitespace().next() {
+                        wanted.insert(acc.to_string());
+                    }
                 }
             }
+
+            let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
+
+            let custom_source = GenomeSource {
+                fetch_path: custom_path.clone(),
+                gzipped: custom_path.ends_with(".gz"),
+                taxid: 0,
+                assembly_accession: "custom_user_file".to_string(),
+            };
+
+            let (shared_writers, shared_handles) = SharedWriters::new(&genome_dir, "custom")?;
+
+            let pipeline_cfg = PipelineConfig {
+                domain_name: "custom".to_string(),
+                source_label: "custom_file".to_string(),
+                output_genome_dir: genome_dir.clone(),
+                backend: Arc::clone(&backend),
+                concurrent_downloads: 1,
+                max_in_flight_chunks: cfg.in_flight_chunks,
+                batch_threshold_bytes: 64 * 1024 * 1024,
+                relevant_taxids: Arc::clone(&relevant_taxids),
+                shared: Arc::clone(&shared_writers),
+                custom_map: Some(Arc::new(custom_map)),
+                no_mask: cfg.no_mask,
+                drop_unmapped: false, // custom FASTA keeps unmapped records (taxid 0)
+            };
+
+            let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;
+            finalize_shared(shared_writers, shared_handles).await?;
+
+            total_stats.genomes_processed += stats.genomes_processed;
+            total_stats.records_in_target += stats.records_in_target;
+
+            tokio::fs::write(&done_marker, b"")
+                .await
+                .with_context(|| format!("write done marker {}", done_marker.display()))?;
         }
-
-        let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
-
-        let custom_source = GenomeSource {
-            fetch_path: custom_path.clone(),
-            gzipped: custom_path.ends_with(".gz"),
-            taxid: 0,
-            assembly_accession: "custom_user_file".to_string(),
-        };
-
-        let pipeline_cfg = PipelineConfig {
-            domain_name: "custom".to_string(),
-            source_label: "custom_file".to_string(),
-            output_genome_dir: genome_dir.clone(),
-            backend: Arc::clone(&backend),
-            concurrent_downloads: 1,
-            max_in_flight_chunks: cfg.in_flight_chunks,
-            batch_threshold_bytes: 64 * 1024 * 1024,
-            relevant_taxids: Arc::clone(&relevant_taxids),
-            shared: Arc::clone(&shared_writers),
-            custom_map: Some(Arc::new(custom_map)),
-            no_mask: cfg.no_mask,
-            drop_unmapped: false, // custom FASTA keeps unmapped records (taxid 0)
-        };
-
-        let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;
-        
-        total_stats.genomes_processed += stats.genomes_processed;
-        total_stats.records_in_target += stats.records_in_target;
-        domain_list.push("custom".to_string());
     }
 
-    finalize_target_fasta(&out_dir, &domain_list).await?;
-    finalize_shared(shared_writers, shared_handles).await?;
+    finalize_outputs(&out_dir, &genome_dir).await?;
 
     eprintln!("Prep is done!");
     eprintln!("Total target accessions: {}", total_stats.records_in_target);

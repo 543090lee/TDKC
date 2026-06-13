@@ -62,9 +62,9 @@ pub struct SharedWriterHandles {
 }
 
 impl SharedWriters {
-    pub fn new(out_dir: &Path) -> Result<(Arc<Self>, SharedWriterHandles)> {
-        let prelim_path = out_dir.join("prelim_map.txt");
-        let manifest_path = out_dir.join("genome").join("manifest.tsv");
+    pub fn new(genome_dir: &Path, domain_name: &str) -> Result<(Arc<Self>, SharedWriterHandles)> {
+        let prelim_path = genome_dir.join(format!("_prelim.{}.txt", domain_name));
+        let manifest_path = genome_dir.join(format!("_manifest.{}.tsv", domain_name));
 
         let (prelim_tx, mut prelim_rx) =
             mpsc::unbounded_channel::<(String, u32)>();
@@ -75,7 +75,6 @@ impl SharedWriters {
                 .await
                 .with_context(|| format!("create {}", prelim_path.display()))?;
             let mut w = TokioBufWriter::with_capacity(4 * 1024 * 1024, f);
-            w.write_all(b"accession\ttaxid\n").await?;
             while let Some((acc, taxid)) = prelim_rx.recv().await {
                 let line = format!("{}\t{}\n", acc, taxid);
                 w.write_all(line.as_bytes()).await?;
@@ -89,8 +88,6 @@ impl SharedWriters {
                 .await
                 .with_context(|| format!("create {}", manifest_path.display()))?;
             let mut w = TokioBufWriter::with_capacity(1 * 1024 * 1024, f);
-            w.write_all(b"assembly_accession\tsource\ttaxid\tbytes_received\tsha256\n")
-                .await?;
             while let Some(row) = manifest_rx.recv().await {
                 let line = format!(
                     "{}\t{}\t{}\t{}\t{}\n",
@@ -678,33 +675,69 @@ async fn write_wrapped_fasta_seq<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-pub async fn finalize_target_fasta(
-    out_dir: &Path,
-    domain_names: &[String],
-) -> Result<u64> {
-    let target_path = out_dir.join("target.fasta");
-    let target_file = TokioFile::create(&target_path)
-        .await
-        .with_context(|| format!("create {}", target_path.display()))?;
-    let mut target_w = TokioBufWriter::with_capacity(8 * 1024 * 1024, target_file);
-
-    let mut total: u64 = 0;
-    for domain in domain_names {
-        let shard_path = out_dir.join("genome").join(format!("_target.{}.fna", domain));
-        if !shard_path.exists() {
-            continue;
+fn collect_shards(genome_dir: &Path, prefix: &str, suffix: &str) -> Result<Vec<PathBuf>> {
+    let mut shards = Vec::new();
+    let rd = match std::fs::read_dir(genome_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(shards),
+        Err(e) => return Err(e).with_context(|| format!("read_dir {}", genome_dir.display())),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.ends_with(suffix) {
+            shards.push(entry.path());
         }
-        let mut shard = TokioFile::open(&shard_path)
-            .await
-            .with_context(|| format!("open shard {}", shard_path.display()))?;
-        let n = tokio::io::copy(&mut shard, &mut target_w)
-            .await
-            .with_context(|| format!("copying shard {}", shard_path.display()))?;
-        total += n;
-        // Best-effort delete — the run is done either way
-        let _ = tokio::fs::remove_file(&shard_path).await;
     }
-    target_w.flush().await?;
+    shards.sort();
+    Ok(shards)
+}
+
+async fn concat_shards(
+    shards: &[PathBuf],
+    out_path: &Path,
+    header: Option<&[u8]>,
+) -> Result<u64> {
+    let out_file = TokioFile::create(out_path)
+        .await
+        .with_context(|| format!("create {}", out_path.display()))?;
+    let mut w = TokioBufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    if let Some(h) = header {
+        w.write_all(h).await?;
+    }
+    let mut total: u64 = 0;
+    for shard in shards {
+        let mut f = TokioFile::open(shard)
+            .await
+            .with_context(|| format!("open shard {}", shard.display()))?;
+        total += tokio::io::copy(&mut f, &mut w)
+            .await
+            .with_context(|| format!("copying shard {}", shard.display()))?;
+    }
+    w.flush().await?;
+    Ok(total)
+}
+
+pub async fn finalize_outputs(out_dir: &Path, genome_dir: &Path) -> Result<u64> {
+    let target_shards = collect_shards(genome_dir, "_target.", ".fna")?;
+    let prelim_shards = collect_shards(genome_dir, "_prelim.", ".txt")?;
+    let manifest_shards = collect_shards(genome_dir, "_manifest.", ".tsv")?;
+
+    let total = concat_shards(&target_shards, &out_dir.join("target.fasta"), None).await?;
+    concat_shards(
+        &prelim_shards,
+        &out_dir.join("prelim_map.txt"),
+        Some(b"accession\ttaxid\n"),
+    )
+    .await?;
+    concat_shards(
+        &manifest_shards,
+        &genome_dir.join("manifest.tsv"),
+        Some(b"assembly_accession\tsource\ttaxid\tbytes_received\tsha256\n"),
+    )
+    .await?;
+
     Ok(total)
 }
 
@@ -712,7 +745,7 @@ pub async fn finalize_shared(
     shared: Arc<SharedWriters>,
     handles: SharedWriterHandles,
 ) -> Result<()> {
-    
+
     drop(shared);
     handles.prelim_map.await
         .map_err(|e| anyhow!("prelim_map writer panicked: {e}"))??;

@@ -228,6 +228,14 @@ pub async fn download_taxdump(
 ) -> Result<TaxdumpPaths> {
     let tax_dir = output_dir.join("taxonomy");
     tokio::fs::create_dir_all(&tax_dir).await?;
+
+    let nodes = tax_dir.join("nodes.dmp");
+    let names = tax_dir.join("names.dmp");
+    if nodes.exists() && names.exists() {
+        eprintln!("Taxonomy already present, skipping download.");
+        return Ok(TaxdumpPaths { nodes_dmp: nodes, names_dmp: names });
+    }
+
     eprintln!("Downloading taxonomy information ...");
 
     let buf = with_retry("taxdump", 5, || async {
