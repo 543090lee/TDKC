@@ -194,7 +194,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let mut delay = Duration::from_secs(1);
+    let mut delay = Duration::from_secs(2);
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=max_attempts {
         match f().await {
@@ -209,7 +209,7 @@ where
                     label, attempt, max_attempts, e, delay
                 );
                 tokio::time::sleep(delay).await;
-                delay *= 2;
+                delay = delay.mul_f32(1.5);
                 last_err = Some(e);
             }
         }
@@ -387,37 +387,82 @@ pub async fn fetch_assembly_summary(
             ftp_path: ftp_path.to_string(),
         });
     }
-    eprintln!("  [{}] {} genomes after filter", domain, out.len());
     Ok(out)
+}
+
+const ACC2TAXID_SOURCES: [&str; 2] =
+    ["nucl_gb.accession2taxid.gz", "nucl_wgs.accession2taxid.gz"];
+
+pub async fn prefetch_acc2taxid(backend: &dyn Backend, tax_dir: &Path) -> Result<()> {
+    for src in ACC2TAXID_SOURCES {
+        let local = tax_dir.join(src.trim_end_matches(".gz"));
+        if !local.exists() {
+            let remote = format!("/pub/taxonomy/accession2taxid/{}", src);
+            ensure_acc2taxid_on_disk(backend, &remote, &local).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn fetch_acc2taxid_filtered(
     backend: &dyn Backend,
     wanted: &std::collections::HashSet<String>,
+    tax_dir: &Path,
 ) -> Result<FxHashMap<String, u32>> {
     let mut out: FxHashMap<String, u32> = FxHashMap::default();
     if wanted.is_empty() {
         return Ok(out);
     }
 
-    for src in ["nucl_gb.accession2taxid.gz", "nucl_wgs.accession2taxid.gz"] {
+    for src in ACC2TAXID_SOURCES {
         if out.len() >= wanted.len() {
             break;
         }
-        let path = format!("/pub/taxonomy/accession2taxid/{}", src);
+        let remote = format!("/pub/taxonomy/accession2taxid/{}", src);
+        let local = tax_dir.join(src.trim_end_matches(".gz"));
 
-        let new_entries: Vec<(String, u32)> =
-            with_retry(&format!("acc2taxid[{}]", src), 5, || async {
-                let (rdr, _sha) = stream_gz(backend, &path).await?;
-                stream_acc2taxid_into(rdr, wanted).await
-            })
-            .await?;
+        if !local.exists() {
+            ensure_acc2taxid_on_disk(backend, &remote, &local).await?;
+        }
+
+        let f = tokio::fs::File::open(&local).await
+            .with_context(|| format!("open acc2taxid {}", local.display()))?;
+        let new_entries = stream_acc2taxid_into(f, wanted).await?;
 
         for (k, v) in new_entries {
             out.entry(k).or_insert(v);
         }
     }
     Ok(out)
+}
+
+async fn ensure_acc2taxid_on_disk(
+    backend: &dyn Backend,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = local_path.with_extension("partial");
+    let tmp_owned = tmp.clone();
+    with_retry(&format!("acc2taxid-download[{}]", remote_path), 5, || {
+        let tmp_owned = tmp_owned.clone();
+        async move {
+            let (mut rdr, _sha) = stream_gz(backend, remote_path).await?;
+            let out_file = tokio::fs::File::create(&tmp_owned).await
+                .with_context(|| format!("create {}", tmp_owned.display()))?;
+            let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+            tokio::io::copy(&mut rdr, &mut writer).await
+                .with_context(|| format!("decompressing {}", remote_path))?;
+            writer.flush().await?;
+            Ok(())
+        }
+    })
+    .await?;
+    tokio::fs::rename(&tmp, local_path).await
+        .with_context(|| format!("rename {} -> {}", tmp.display(), local_path.display()))?;
+    Ok(())
 }
 
 async fn stream_acc2taxid_into<R>(

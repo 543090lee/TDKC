@@ -158,11 +158,6 @@ pub async fn run_pipeline(
     cfg: PipelineConfig,
     sources: Vec<GenomeSource>,
 ) -> Result<PipelineStats> {
-    eprintln!(
-        "[{}] starting pipeline",
-        cfg.domain_name,
-    );
-
     let (chunks_tx, mut chunks_rx) =
         mpsc::channel::<ByteChunk>(cfg.max_in_flight_chunks.max(1));
     let (mask_tx, mut mask_rx) =
@@ -309,7 +304,7 @@ async fn download_one(
 ) -> Result<()> {
     let label = format!("download[{}/{}]", domain_name, source.assembly_accession);
 
-    let (mut reader, sha) = with_retry(&label, 3, || async {
+    let (mut reader, sha) = with_retry(&label, 5, || async {
         // lets check if this path actually exists on your computer
         let is_local = std::path::Path::new(&source.fetch_path).exists();
         
@@ -698,7 +693,7 @@ async fn concat_shards(
     shards: &[PathBuf],
     out_path: &Path,
     header: Option<&[u8]>,
-) -> Result<u64> {
+) -> Result<()> {
     let out_file = TokioFile::create(out_path)
         .await
         .with_context(|| format!("create {}", out_path.display()))?;
@@ -706,25 +701,24 @@ async fn concat_shards(
     if let Some(h) = header {
         w.write_all(h).await?;
     }
-    let mut total: u64 = 0;
     for shard in shards {
         let mut f = TokioFile::open(shard)
             .await
             .with_context(|| format!("open shard {}", shard.display()))?;
-        total += tokio::io::copy(&mut f, &mut w)
+        tokio::io::copy(&mut f, &mut w)
             .await
             .with_context(|| format!("copying shard {}", shard.display()))?;
     }
     w.flush().await?;
-    Ok(total)
+    Ok(())
 }
 
-pub async fn finalize_outputs(out_dir: &Path, genome_dir: &Path) -> Result<u64> {
+pub async fn finalize_outputs(out_dir: &Path, genome_dir: &Path) -> Result<()> {
     let target_shards = collect_shards(genome_dir, "_target.", ".fna")?;
     let prelim_shards = collect_shards(genome_dir, "_prelim.", ".txt")?;
     let manifest_shards = collect_shards(genome_dir, "_manifest.", ".tsv")?;
 
-    let total = concat_shards(&target_shards, &out_dir.join("target.fasta"), None).await?;
+    concat_shards(&target_shards, &out_dir.join("target.fasta"), None).await?;
     concat_shards(
         &prelim_shards,
         &out_dir.join("prelim_map.txt"),
@@ -738,7 +732,7 @@ pub async fn finalize_outputs(out_dir: &Path, genome_dir: &Path) -> Result<u64> 
     )
     .await?;
 
-    Ok(total)
+    Ok(())
 }
 
 pub async fn finalize_shared(

@@ -36,8 +36,9 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     let backend = make_backend(BackendKind::Http)?;
 
     let tax_paths = download_taxdump(backend.as_ref(), &out_dir).await?;
+    let tax_dir = out_dir.join("taxonomy");
 
-    
+
     let nodes_path = tax_paths.nodes_dmp.to_string_lossy();
     let taxonomy = TaxonomyTree::load(nodes_path.as_ref())?;
     
@@ -55,6 +56,10 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
 
     if !domain_list.iter().any(|d| d == "univec" || d == "univec_core") {
         domain_list.push("univec_core".to_string());
+    }
+
+    if cfg.custom_fasta.is_some() || domain_list.iter().any(|d| d == "plasmid") {
+        prefetch_acc2taxid(backend.as_ref(), &tax_dir).await?;
     }
 
     let mut total_stats = PipelineStats::default();
@@ -90,7 +95,6 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             tokio::fs::create_dir_all(&cache_dir).await?;
 
             let files = list_refseq_catalog_files(backend.as_ref(), "plasmid").await?;
-            eprintln!("  [plasmid] {} catalog files", files.len());
 
             let mut wanted = std::collections::HashSet::new();
             for fname in files {
@@ -109,12 +113,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
                 });
             }
 
-            eprintln!(
-                "  [plasmid] resolving taxids for {} sequences via accession2taxid",
-                wanted.len()
-            );
-            let map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
-            eprintln!("  [plasmid] mapped {}/{} accessions", map.len(), wanted.len());
+            let map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted, &tax_dir).await?;
             domain_custom_map = Some(Arc::new(map));
 
         } else {
@@ -191,7 +190,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
                 }
             }
 
-            let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted).await?;
+            let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted, &tax_dir).await?;
 
             let custom_source = GenomeSource {
                 fetch_path: custom_path.clone(),

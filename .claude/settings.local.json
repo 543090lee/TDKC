@@ -3,7 +3,9 @@
     "allow": [
       "WebFetch(domain:github.com)",
       "Bash(cargo test *)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo clippy *)"
     ]
   }
 }
