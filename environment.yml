@@ -8,5 +8,7 @@ dependencies:
   - c-compiler
   - cxx-compiler
   - make
+  - cmake
+  - openssl
   - pkg-config
   - blast
