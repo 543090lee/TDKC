@@ -75,7 +75,7 @@ tdkc prep \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--domains` | `bacteria,viral,archaea,human` | Comma-separated RefSeq domains to download. Valid values: `bacteria`, `viral`, `archaea`, `human`, `fungi`, `invertebrate`, `plant`, `plasmid`, `protozoa`. UniVec_Core is always included automatically. |
+| `--domains` | `bacteria,viral,archaea,human,plasmid` | Comma-separated RefSeq domains to download. Valid values: `bacteria`, `viral`, `archaea`, `human`, `fungi`, `invertebrate`, `plant`, `plasmid`, `protozoa`. UniVec_Core is always included automatically. |
 | `-t` / `--targets` | — | Path to targets file (one NCBI taxid per line, any rank). A copy is saved into the db dir as `targets.txt`. |
 | `-d` / `--db` | `tdkc_db` | Database output directory. This becomes the input for every subsequent command. |
 | `--custom` | — | Path to a local FASTA file to include. |
