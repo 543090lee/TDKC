@@ -11,7 +11,7 @@
 [![Release](https://github.com/543090lee/TDKC/actions/workflows/release.yml/badge.svg)](https://github.com/543090lee/TDKC/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
-[![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://github.com/543090lee/TDKC)
+[![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1)
 [![version](https://img.shields.io/badge/version-v0.1.0-lightgrey?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC)
 
 
