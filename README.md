@@ -12,16 +12,14 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
 [![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1)
-[![version](https://img.shields.io/badge/version-v0.1.0-lightgrey?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC)
+[![version](https://img.shields.io/github/v/release/543090lee/TDKC?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC/releases/latest)
 
-
-[Paper](https://github.com/543090lee/TDKC) · [Getting Started](#quick-start) · [Citation](#citation)
+[Paper](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1) · [Getting Started](#quick-start) · [Citation](#citation)
 
 </div>
----
 
-## 📢 News & Updates
-* **[Under Development]** I am working on an even faster version of TDKC featuring multithreaded gzip decompression. This upcoming release is specifically optimized to handle massive clinical diagnostic reads with maximum efficiency. Stay tuned!
+> [TIP]
+> **Just want to run TDKC?** A prebuilt, target-distilled index is available on Zenodo. See [Prebuilt Database](#prebuilt-database).
 
 ---
 ## Installation
@@ -33,7 +31,7 @@ conda env create -f environment.yml
 conda activate tdkc
 cargo install --path .
 
-# or with mamba (faster)
+# or with mamba (faster and recommended)
 mamba env create -f environment.yml
 mamba activate tdkc
 ```
@@ -213,6 +211,31 @@ tdkc inspect --db tdkc_db/
 ```
 
 This will output inspect.txt with number of minimizers each taxID has and its ratio.
+
+---
+
+
+## Prebuilt Database
+  
+**https://doi.org/10.5281/zenodo.21343246** &nbsp;·&nbsp; CC-BY-4.0
+ 
+```bash
+wget "https://zenodo.org/records/21343246/files/tdkc_db_v1.0.0.tar.gz"
+tar xzf tdkc_db_v1.0.0.tar.gz
+ 
+# Verify integrity
+cd tdkc_db && sha256sum -c checksums.sha256 && cd ..
+ 
+# Classify
+tdkc query \
+  --db tdkc_db/ \
+  -1 sample_R1.fastq.gz \
+  -2 sample_R2.fastq.gz \
+  -j 32 \
+  -o results
+```
+
+> **Coming soon:** We are planning to build a dedicated platform serving periodically updated TDKC databases
 
 ---
 
