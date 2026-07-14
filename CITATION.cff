@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use TDKC, please cite the paper listed under preferred-citation."
+title: "TDKC: Target Distilled K-mer Classifier"
+abstract: "Ultrafast and memory-efficient metagenomic sequence classification for targeted pathogen diagnostics."
+type: software
+authors:
+  - given-names: Seungmo
+    family-names: Lee
+    email: seungmo6@g.ucla.edu
+    affiliation: "Department of Computer Science, University of California, Los Angeles"
+    orcid: "https://orcid.org/0009-0004-7831-8251"
+  - given-names: Vivek
+    family-names: Agarwal
+    affiliation: "Department of Computational Medicine, University of California, Los Angeles"
+  - given-names: William
+    family-names: "O'Brien"
+    affiliation: "Department of Computer Science, University of California, Los Angeles"
+  - given-names: Eleazar
+    family-names: Eskin
+    email: eeskin@cs.ucla.edu
+    affiliation: "Departments of Computer Science and Computational Medicine, University of California, Los Angeles"
+repository-code: "https://github.com/543090lee/TDKC"
+license: MIT
+version: 1.0.0
+preferred-citation:
+  type: article
+  title: "TDKC (Target Distilled K-mer Classifier): Ultrafast and Memory-Efficient Sequence Classification for Target Pathogen Diagnostics"
+  authors:
+    - given-names: Seungmo
+      family-names: Lee
+    - given-names: Vivek
+      family-names: Agarwal
+    - given-names: William
+      family-names: "O'Brien"
+    - given-names: Eleazar
+      family-names: Eskin
+  year: 2026
+  journal: "bioRxiv"
+  doi: "10.64898/2026.06.05.730319"
