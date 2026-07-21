@@ -27,16 +27,13 @@
 ```bash
 git clone https://github.com/543090lee/TDKC.git
 cd TDKC
-conda env create -f environment.yml
-conda activate tdkc
-cargo install --path .
-
-# or with mamba (faster and recommended)
 mamba env create -f environment.yml
 mamba activate tdkc
+cargo install --path .
+
 ```
 
-The binary will be at `./target/release/tdkc` (and also on your `PATH` inside the `tdkc` env).
+This installs the tdkc binary to `~/.cargo/bin` (on your `PATH`)
 
 ---
 
@@ -46,7 +43,7 @@ TDKC has three main steps: `prep` → `build` → `query`.
 
 ### 1. Prep
 
-Download reference sequences from NCBI via **HTTPS** (no FTP or rsync), filter to your target taxa, and produce a local accession2taxid map. The output directory is the database, and every later command points at it.
+Download reference sequences from NCBI via HTTPS concurrently (no FTP or rsync), filter to your target taxa, and produce a local accession2taxid map. The output directory is the database, and every later command points at it.
 
 ```bash
 tdkc prep \

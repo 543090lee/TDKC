@@ -21,7 +21,27 @@ pub struct PrepConfig {
     pub no_mask: bool,
 }
 
+fn ensure_dustmasker_available() -> Result<()> {
+    match std::process::Command::new("dustmasker")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "`dustmasker` not found on PATH. Install NCBI BLAST+ (e.g. `brew install blast` \
+             or `conda install -c bioconda blast`), or re-run with --no-mask to skip masking."
+        )),
+        Err(e) => Err(e).context("failed to invoke dustmasker"),
+    }
+}
+
 pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
+    if !cfg.no_mask {
+        ensure_dustmasker_available()?;
+    }
+
     let out_dir = PathBuf::from(&cfg.db_dir);
     let genome_dir = out_dir.join("genome");
 
@@ -35,7 +55,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
 
     let backend = make_backend(BackendKind::Http)?;
 
-    let tax_paths = download_taxdump(backend.as_ref(), &out_dir).await?;
+    let tax_paths = download_taxdump(&backend, &out_dir).await?;
     let tax_dir = out_dir.join("taxonomy");
 
 
@@ -59,7 +79,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     }
 
     if cfg.custom_fasta.is_some() || domain_list.iter().any(|d| d == "plasmid") {
-        prefetch_acc2taxid(backend.as_ref(), &tax_dir).await?;
+        prefetch_acc2taxid(&backend, &tax_dir).await?;
     }
 
     let mut total_stats = PipelineStats::default();
@@ -88,37 +108,35 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             });
 
         } else if domain == "plasmid" {
-            // plasmid has no assembly_summary.txt; mirror Kraken2's special case:
-            // download every catalog file, then assign taxids per-sequence via
-            // accession2taxid (there is no per-assembly taxid to inherit).
+            // plasmid has no assembly_summary.txt; use accession2taxid
             let cache_dir = genome_dir.join(".plasmid_cache");
             tokio::fs::create_dir_all(&cache_dir).await?;
 
-            let files = list_refseq_catalog_files(backend.as_ref(), "plasmid").await?;
+            let files = list_refseq_catalog_files(&backend, "plasmid").await?;
 
             let mut wanted = std::collections::HashSet::new();
             for fname in files {
                 let remote = format!("/genomes/refseq/plasmid/{}", fname);
                 let local = cache_dir.join(fname.trim_end_matches(".gz"));
                 let accs =
-                    fetch_and_decompress_to(backend.as_ref(), &remote, &local).await?;
+                    fetch_and_decompress_to(&backend, &remote, &local).await?;
                 for a in accs {
                     wanted.insert(a);
                 }
                 sources.push(GenomeSource {
                     fetch_path: local.to_string_lossy().into_owned(),
                     gzipped: false,
-                    taxid: 0, // resolved per-record from the accession2taxid map below
+                    taxid: 0, 
                     assembly_accession: fname,
                 });
             }
 
-            let map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted, &tax_dir).await?;
+            let map = fetch_acc2taxid_filtered(&backend, &wanted, &tax_dir).await?;
             domain_custom_map = Some(Arc::new(map));
 
         } else {
             // Standard RefSeq 
-            let entries = fetch_assembly_summary(backend.as_ref(), domain).await?;
+            let entries = fetch_assembly_summary(&backend, domain).await?;
             
             for entry in entries {
                 match entry.fna_gz_path() {
@@ -157,7 +175,6 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         finalize_shared(shared_writers, shared_handles).await?;
 
         if domain == "plasmid" {
-            // The decompressed catalog files have been re-emitted into plasmid.fna.
             let _ = tokio::fs::remove_dir_all(genome_dir.join(".plasmid_cache")).await;
         }
 
@@ -190,7 +207,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
                 }
             }
 
-            let custom_map = fetch_acc2taxid_filtered(backend.as_ref(), &wanted, &tax_dir).await?;
+            let custom_map = fetch_acc2taxid_filtered(&backend, &wanted, &tax_dir).await?;
 
             let custom_source = GenomeSource {
                 fetch_path: custom_path.clone(),
@@ -213,7 +230,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
                 shared: Arc::clone(&shared_writers),
                 custom_map: Some(Arc::new(custom_map)),
                 no_mask: cfg.no_mask,
-                drop_unmapped: false, // custom FASTA keeps unmapped records (taxid 0)
+                drop_unmapped: false,
             };
 
             let stats = run_pipeline(pipeline_cfg, vec![custom_source]).await?;

@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio_util::io::StreamReader;
+use futures::StreamExt;
 
 
 #[derive(Clone, Copy, Debug)]
@@ -20,7 +21,7 @@ pub enum BackendKind {
 
 #[async_trait]
 pub trait Backend: Send + Sync {
-    async fn fetch(&self, path: &str) -> Result<reqwest::Response>;
+    async fn fetch_range(&self, path: &str, start: u64) -> Result<reqwest::Response>;
 }
 
 pub struct HttpBackend {
@@ -42,16 +43,20 @@ impl HttpBackend {
 
 #[async_trait]
 impl Backend for HttpBackend {
-    async fn fetch(&self, path: &str) -> Result<reqwest::Response> {
+    async fn fetch_range(&self, path: &str, start: u64) -> Result<reqwest::Response> {
         let url = format!("{}{}", Self::BASE, path);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {}", url))?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("GET {} returned status {}", url, resp.status()));
+        let mut req = self.client.get(&url);
+        if start > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={}-", start));
+        }
+        let resp = req.send().await.with_context(|| format!("GET {}", url))?;
+        let status = resp.status();
+        if start > 0 {
+            if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(anyhow!("GET {} range from {} expected 206, got {}", url, start, status));
+            }
+        } else if !status.is_success() {
+            return Err(anyhow!("GET {} returned status {}", url, status));
         }
         Ok(resp)
     }
@@ -121,71 +126,90 @@ impl ShaHandle {
     }
 }
 
-pub fn response_to_reader(
-    resp: reqwest::Response,
-) -> (Sha256Reader<StreamReader<ReqwestByteStream, bytes::Bytes>>, ShaHandle) {
-    let stream = ReqwestByteStream::new(resp);
-    let reader = StreamReader::new(stream);
-    Sha256Reader::new(reader)
-}
-
-pub struct ReqwestByteStream {
-    inner: Pin<
-        Box<
-            dyn futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
-                + Send
-                + 'static,
-        >,
-    >,
-}
-
-impl ReqwestByteStream {
-    pub fn new(resp: reqwest::Response) -> Self {
-        Self {
-            inner: Box::pin(resp.bytes_stream()),
-        }
-    }
-}
-
-impl futures::Stream for ReqwestByteStream {
-    type Item = std::io::Result<bytes::Bytes>;
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e,
-            )))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 pub type BoxedReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
-pub async fn stream_raw(
-    backend: &dyn Backend,
-    path: &str,
-) -> Result<(BoxedReader, ShaHandle)> {
-    let resp = backend.fetch(path).await?;
-    let (rdr, h) = response_to_reader(resp);
+async fn reconnect(backend: &Arc<dyn Backend>, path: &str, offset: u64) -> Result<reqwest::Response> {
+    with_retry(&format!("resume[{}]", path), 10, || backend.fetch_range(path, offset)).await
+}
+
+/// Adapt a possibly-interrupted HTTP body into a continuous byte stream: when
+/// the connection drops mid-transfer, reconnect with a `Range` request from the
+/// last received byte and keep going. If a total length is known, a short read
+/// at the end is reported as an error so truncation never passes silently.
+fn resume_stream(
+    backend: Arc<dyn Backend>,
+    path: String,
+    initial: reqwest::Response,
+    total: Option<u64>,
+) -> impl futures::Stream<Item = std::io::Result<bytes::Bytes>> {
+    // Give up if repeated reconnects make no forward progress, so a server that
+    // keeps dropping the body at the same offset can't spin forever.
+    const MAX_STALLED_RESUMES: u32 = 10;
+    async_stream::stream! {
+        let mut offset: u64 = 0;
+        let mut resp = initial;
+        let mut stalled: u32 = 0;
+        loop {
+            let start_offset = offset;
+            let mut body = resp.bytes_stream();
+            let mut interrupted = false;
+            while let Some(item) = body.next().await {
+                match item {
+                    Ok(chunk) => {
+                        offset += chunk.len() as u64;
+                        yield Ok(chunk);
+                    }
+                    Err(_) => {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+            if !interrupted {
+                if let Some(expected) = total {
+                    if offset != expected {
+                        yield Err(std::io::Error::other(format!(
+                            "{}: truncated download, got {} of {} bytes", path, offset, expected)));
+                    }
+                }
+                return;
+            }
+            if offset == start_offset {
+                stalled += 1;
+                if stalled >= MAX_STALLED_RESUMES {
+                    yield Err(std::io::Error::other(format!(
+                        "{}: no progress after {} resume attempts at byte {}", path, stalled, offset)));
+                    return;
+                }
+            } else {
+                stalled = 0;
+            }
+            match reconnect(&backend, &path, offset).await {
+                Ok(next) => resp = next,
+                Err(e) => {
+                    yield Err(std::io::Error::other(format!("{}: resume failed: {:#}", path, e)));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn open_resilient(backend: Arc<dyn Backend>, path: &str) -> Result<(BoxedReader, ShaHandle)> {
+    let resp = backend.fetch_range(path, 0).await?;
+    let total = resp.content_length();
+    let stream = Box::pin(resume_stream(Arc::clone(&backend), path.to_string(), resp, total));
+    let (rdr, h) = Sha256Reader::new(StreamReader::new(stream));
     Ok((Box::pin(rdr), h))
 }
 
-/// Streaming download and on-the-fly gzip decompression
+pub async fn stream_raw(backend: &Arc<dyn Backend>, path: &str) -> Result<(BoxedReader, ShaHandle)> {
+    open_resilient(Arc::clone(backend), path).await
+}
 
-pub async fn stream_gz(
-    backend: &dyn Backend,
-    path: &str,
-) -> Result<(BoxedReader, ShaHandle)> {
-    let resp = backend.fetch(path).await?;
-    let (rdr, h) = response_to_reader(resp);
-    let buffered = BufReader::new(rdr);
-    let decoder = GzipDecoder::new(buffered);
+pub async fn stream_gz(backend: &Arc<dyn Backend>, path: &str) -> Result<(BoxedReader, ShaHandle)> {
+    let (raw, h) = open_resilient(Arc::clone(backend), path).await?;
+    let decoder = GzipDecoder::new(BufReader::new(raw));
     Ok((Box::pin(decoder), h))
 }
 
@@ -223,7 +247,7 @@ pub struct TaxdumpPaths {
 }
 
 pub async fn download_taxdump(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     output_dir: &Path,
 ) -> Result<TaxdumpPaths> {
     let tax_dir = output_dir.join("taxonomy");
@@ -328,7 +352,7 @@ fn strip_ncbi_host(url: &str) -> Option<&str> {
 }
 
 pub async fn fetch_assembly_summary(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     domain: &str,
 ) -> Result<Vec<GenomeEntry>> {
     let remote_dir = if domain == "human" {
@@ -365,14 +389,11 @@ pub async fn fetch_assembly_summary(
         let asm_name = cols[15].trim();
         let ftp_path = cols[19].trim();
 
-        // Match Kraken2 (rsync_from_ncbi.pl): keep only Complete Genome /
-        // Chromosome assemblies. Kraken2 does not filter on version_status or
-        // genome_rep, so neither do we.
+        // Match Kraken2 : keep only Complete Genome /Chromosome assemblies
         if assembly_level != "Complete Genome" && assembly_level != "Chromosome" {
             continue;
         }
-        // Match Kraken2 (download_genomic_library.sh): the human library keeps
-        // only lines mentioning the Genome Reference Consortium submitter.
+        // Match Kraken2 : the human library keeps only lines mentioning the GRC submitters
         if domain == "human" && !line.contains("Genome Reference Consortium") {
             continue;
         }
@@ -393,7 +414,7 @@ pub async fn fetch_assembly_summary(
 const ACC2TAXID_SOURCES: [&str; 2] =
     ["nucl_gb.accession2taxid.gz", "nucl_wgs.accession2taxid.gz"];
 
-pub async fn prefetch_acc2taxid(backend: &dyn Backend, tax_dir: &Path) -> Result<()> {
+pub async fn prefetch_acc2taxid(backend: &Arc<dyn Backend>, tax_dir: &Path) -> Result<()> {
     for src in ACC2TAXID_SOURCES {
         let local = tax_dir.join(src.trim_end_matches(".gz"));
         if !local.exists() {
@@ -405,7 +426,7 @@ pub async fn prefetch_acc2taxid(backend: &dyn Backend, tax_dir: &Path) -> Result
 }
 
 pub async fn fetch_acc2taxid_filtered(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     wanted: &std::collections::HashSet<String>,
     tax_dir: &Path,
 ) -> Result<FxHashMap<String, u32>> {
@@ -437,7 +458,7 @@ pub async fn fetch_acc2taxid_filtered(
 }
 
 async fn ensure_acc2taxid_on_disk(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     remote_path: &str,
     local_path: &Path,
 ) -> Result<()> {
@@ -525,13 +546,9 @@ pub fn resolve_univec(domain: &str) -> UnivecMetadata {
     }
 }
 
-/// Some RefSeq libraries (plasmid, plastid, mitochondrion) have no
-/// assembly_summary.txt; they ship as a numbered set of catalog files like
-/// `plasmid.1.1.genomic.fna.gz`. Kraken2 grabs these with an rsync wildcard;
-/// over HTTP we instead parse the directory listing and pull out every
-/// `<dir>.*.genomic.fna.gz` entry.
+/// Some RefSeq libraries (plasmid, plastid, mitochondrion) have no assembly_summary.txt
 pub async fn list_refseq_catalog_files(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     dir: &str,
 ) -> Result<Vec<String>> {
     let path = format!("/genomes/refseq/{}/", dir);
@@ -545,13 +562,13 @@ pub async fn list_refseq_catalog_files(
     .await?;
 
     let needle = ".genomic.fna.gz";
-    let prefix = format!("{}.", dir); // e.g. "plasmid."
-    let bytes = body.as_bytes(); // NCBI listings are ASCII, so byte == char index
+    let prefix = format!("{}.", dir);
+    let bytes = body.as_bytes();
     let mut seen = std::collections::HashSet::new();
     let mut files = Vec::new();
     for (idx, _) in body.match_indices(needle) {
         let end = idx + needle.len();
-        // Walk back to the start of the filename token.
+        // Walk back to the start of the filename token
         let mut start = idx;
         while start > 0 {
             let c = bytes[start - 1];
@@ -572,11 +589,8 @@ pub async fn list_refseq_catalog_files(
     Ok(files)
 }
 
-/// Stream a gzipped RefSeq catalog file, decompress it to `local_path`, and
-/// return the accession.version of every record (the first whitespace token of
-/// each `>` header) so taxids can be resolved via accession2taxid.
 pub async fn fetch_and_decompress_to(
-    backend: &dyn Backend,
+    backend: &Arc<dyn Backend>,
     remote_path: &str,
     local_path: &Path,
 ) -> Result<Vec<String>> {
@@ -624,7 +638,7 @@ pub async fn stream_local_raw(path: &str) -> Result<(BoxedReader, ShaHandle)> {
 pub async fn stream_local_gz(path: &str) -> Result<(BoxedReader, ShaHandle)> {
     let f = tokio::fs::File::open(path).await
         .with_context(|| format!("failed to open local file {}", path))?;
-    let (rdr, h) = Sha256Reader::new(f); 
+    let (rdr, h) = Sha256Reader::new(f);
     let buffered = BufReader::new(rdr);
     let decoder = GzipDecoder::new(buffered);
     Ok((Box::pin(decoder), h))

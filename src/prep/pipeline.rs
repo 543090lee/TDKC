@@ -141,7 +141,7 @@ pub struct PipelineConfig {
     pub custom_map: Option<Arc<FxHashMap<String, u32>>>,
     pub no_mask: bool,
     /// When a custom_map is present, drop records whose id has no taxid mapping
-    /// instead of emitting them with the fallback taxid (used for plasmid).
+    /// instead of emitting them with the fallback taxid
     pub drop_unmapped: bool,
 }
 
@@ -232,12 +232,16 @@ pub async fn run_pipeline(
         .await
     });
 
-    let bytes_received = downloader_handle.await
-        .map_err(|e| anyhow!("downloader task panicked: {e}"))??;
-    let _chunks_dispatched = masker_handle.await
-        .map_err(|e| anyhow!("masker task panicked: {e}"))??;
-    let mut stats = sink_handle.await
-        .map_err(|e| anyhow!("sink task panicked: {e}"))??;
+    let (dl_res, mask_res, sink_res) =
+        tokio::join!(downloader_handle, masker_handle, sink_handle);
+
+    let sink_res = sink_res.map_err(|e| anyhow!("sink task panicked: {e}"))?;
+    let mask_res = mask_res.map_err(|e| anyhow!("masker task panicked: {e}"))?;
+    let dl_res = dl_res.map_err(|e| anyhow!("downloader task panicked: {e}"))?;
+
+    let mut stats = sink_res?;
+    let _chunks_dispatched = mask_res?;
+    let bytes_received = dl_res?;
     stats.bytes_received = bytes_received;
 
     Ok(stats)
@@ -271,7 +275,7 @@ async fn run_downloaders(
                 .map_err(|_| anyhow!("download semaphore closed"))?;
             download_one(
                 source,
-                backend_c.as_ref(),
+                backend_c,
                 threshold,
                 &chunks_tx_c,
                 &shared_c,
@@ -294,7 +298,7 @@ async fn run_downloaders(
 
 async fn download_one(
     source: GenomeSource,
-    backend: &dyn Backend,
+    backend: Arc<dyn Backend>,
     threshold: usize,
     chunks_tx: &mpsc::Sender<ByteChunk>,
     shared: &SharedWriters,
@@ -317,9 +321,9 @@ async fn download_one(
         } else {
             // It's not local, so fetch it from NCBI
             if source.gzipped {
-                stream_gz(backend, &source.fetch_path).await?
+                stream_gz(&backend, &source.fetch_path).await?
             } else {
-                stream_raw(backend, &source.fetch_path).await?
+                stream_raw(&backend, &source.fetch_path).await?
             }
         };
         Ok::<_, anyhow::Error>(pair)
@@ -328,7 +332,8 @@ async fn download_one(
 
     let mut accum: Vec<u8> = Vec::with_capacity(threshold + 4 * 1024 * 1024);
     let mut read_buf = vec![0u8; 256 * 1024];
-    let mut emitted_any = false;
+    let mut scanned = 0usize;
+    let mut last_boundary: Option<usize> = None;
 
     loop {
         let n = reader.read(&mut read_buf).await
@@ -336,17 +341,25 @@ async fn download_one(
         if n == 0 {
             break;
         }
-        let read_slice = &read_buf[..n];
-        accum.extend_from_slice(read_slice);
-        
+        accum.extend_from_slice(&read_buf[..n]);
+
+        if accum[0] != b'>' {
+            bail!("stream for {} does not start with '>'", source.fetch_path);
+        }
+
+        let scan_from = scanned.max(1);
+        for pos in memchr::memchr_iter(b'>', &accum[scan_from..]) {
+            let at = scan_from + pos;
+            if accum[at - 1] == b'\n' {
+                last_boundary = Some(at);
+            }
+        }
+        scanned = accum.len();
+
         while accum.len() >= threshold {
-            let split_at = find_record_boundary(&accum, !emitted_any);
-            match split_at {
-                Some(0) => {
-                    break;
-                }
-                Some(idx) => {
-                    let chunk_bytes: Vec<u8> = accum.drain(..idx).collect();
+            match last_boundary.take() {
+                Some(split) => {
+                    let chunk_bytes: Vec<u8> = accum.drain(..split).collect();
                     send_chunk(
                         chunks_tx,
                         chunk_bytes,
@@ -354,15 +367,9 @@ async fn download_one(
                         source.assembly_accession.clone(),
                     )
                     .await?;
-                    emitted_any = true;
+                    scanned -= split;
                 }
-                None => {
-                    bail!(
-                        "no FASTA record boundary in {} after {} bytes (malformed input?)",
-                        source.fetch_path,
-                        accum.len()
-                    );
-                }
+                None => break,
             }
         }
     }
@@ -408,42 +415,6 @@ async fn send_chunk(
         })
         .await
         .map_err(|_| anyhow!("masker stage closed channel"))
-}
-
-#[inline]
-fn find_record_boundary(buf: &[u8], is_first_chunk_of_genome: bool) -> Option<usize> {
-    if buf.is_empty() {
-        return None;
-    }
-    
-    if buf[0] != b'>' {
-        return None;
-    }
-    if let Some(nl_pos) = rfind_nl_gt(buf) {
-        return Some(nl_pos + 1); 
-    }
-    if is_first_chunk_of_genome {
-        Some(0)
-    } else {
-        Some(0)
-    }
-}
-
-#[inline]
-fn rfind_nl_gt(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 2 {
-        return None;
-    }
-    let mut i = buf.len() - 2;
-    loop {
-        if buf[i] == b'\n' && buf[i + 1] == b'>' {
-            return Some(i);
-        }
-        if i == 0 {
-            return None;
-        }
-        i -= 1;
-    }
 }
 
 async fn eof_worker(chunk: ByteChunk, no_mask: bool) -> Result<MaskedChunk> {
@@ -552,10 +523,8 @@ fn parse_masked_fasta(bytes: &[u8]) -> Result<Vec<MaskedRecord>> {
 
         let record_id = match std::str::from_utf8(&header) {
             Ok(s) => s.split_whitespace().next().unwrap_or("").to_string(),
-            Err(_) => continue, 
+            Err(_) => continue,
         };
-        if record_id.is_empty() {
-        }
 
         let mut seq = Vec::with_capacity(64);
         while i < bytes.len() && bytes[i] != b'>' {
