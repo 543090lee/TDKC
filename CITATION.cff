@@ -21,7 +21,7 @@ authors:
     affiliation: "Departments of Computer Science and Computational Medicine, University of California, Los Angeles"
 repository-code: "https://github.com/543090lee/TDKC"
 license: MIT
-version: 1.0.0
+version: 1.0.2
 preferred-citation:
   type: article
   title: "TDKC (Target Distilled K-mer Classifier): Ultrafast and Memory-Efficient Sequence Classification for Target Pathogen Diagnostics"
