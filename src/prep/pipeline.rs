@@ -308,7 +308,7 @@ async fn download_one(
 ) -> Result<()> {
     let label = format!("download[{}/{}]", domain_name, source.assembly_accession);
 
-    let (mut reader, sha) = with_retry(&label, 5, || async {
+    let attempt = with_retry(&label, 5, || async {
         // lets check if this path actually exists on your computer
         let is_local = std::path::Path::new(&source.fetch_path).exists();
         
@@ -328,7 +328,18 @@ async fn download_one(
         };
         Ok::<_, anyhow::Error>(pair)
     })
-    .await?;
+    .await;
+
+    let (mut reader, sha) = match attempt {
+        Ok(pair) => pair,
+        Err(e) if format!("{:#}", e).contains("returned status 404") => {
+            // NCBI withdrew this assembly's sequence file. it only has the dir/file left
+            // so skipping it.
+            eprintln!("[skip-404] {}: {:#}", label, e);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut accum: Vec<u8> = Vec::with_capacity(threshold + 4 * 1024 * 1024);
     let mut read_buf = vec![0u8; 256 * 1024];
