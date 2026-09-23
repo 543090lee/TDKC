@@ -14,8 +14,9 @@
 [![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1)
 [![version](https://img.shields.io/github/v/release/543090lee/TDKC?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC/releases/latest)
 
+[![Bioconda downloads](https://img.shields.io/conda/dn/bioconda/tdkc)](https://anaconda.org/bioconda/tdkc) [![Install with Bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/tdkc/README.html)
+
 [Paper](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1) · [Getting Started](#quick-start) · [Citation](#citation)
-[![Install with Bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/tdkc/README.html)
 
 
 </div>
