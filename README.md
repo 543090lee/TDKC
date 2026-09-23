@@ -15,6 +15,8 @@
 [![version](https://img.shields.io/github/v/release/543090lee/TDKC?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC/releases/latest)
 
 [Paper](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1) · [Getting Started](#quick-start) · [Citation](#citation)
+[![Install with Bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/tdkc/README.html)
+
 
 </div>
 
@@ -24,13 +26,25 @@
 ---
 ## Installation
 
+### Bioconda
+
+Install TDKC in a new environment:
+
+```bash
+mamba create -n tdkc -c conda-forge -c bioconda tdkc
+mamba activate tdkc
+```
+
+### From source
+
+To build the latest code from this repository:
+
 ```bash
 git clone https://github.com/543090lee/TDKC.git
 cd TDKC
 mamba env create -f environment.yml
 mamba activate tdkc
 cargo install --path .
-
 ```
 
 This installs the tdkc binary to `~/.cargo/bin` (on your `PATH`)
