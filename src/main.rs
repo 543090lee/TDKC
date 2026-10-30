@@ -90,7 +90,7 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = 1)]
         threads: usize,
 
-        #[arg(short = 'a', long = "accession-tracking", conflicts_with = "no_output")]
+        #[arg(short = 'a', long = "accession-tracking")]
         accession: bool,
 
         #[arg(short = 'g', long, default_value_t = 2)]
@@ -238,6 +238,10 @@ fn main() -> anyhow::Result<()> {
             domain_penalty,
             counts,
         } => {
+            if accession && no_output && !counts {
+                anyhow::bail!("With --no-output, accession tracking (-a) needs at least the count summary: add -c to write <sample>.strain.txt");
+            }
+
             let mut samples = Vec::new();
             if let Some(dir_path) = input_dir {
                 std::fs::create_dir_all(&output_prefix)?;

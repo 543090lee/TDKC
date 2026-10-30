@@ -165,6 +165,8 @@ Using these flags provides detailed strain-level information:
 * `-a`: Includes the per k-mer set of accession hits in .output file
 * `-c`: Generate `results/sample.strain.txt` summary file that includes the per-accession total and unique hit counts for the entire sample
 
+`-c` requires `-a`. If you only want the strain summary and not the (potentially very large) per-read .output file, add `--no-output`: `tdkc query ... -a -c --no-output` writes only `.report` and `.strain.txt`. `-a --no-output` without `-c` is rejected, since nothing would be left to write the accession hits to.
+
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -178,7 +180,7 @@ Using these flags provides detailed strain-level information:
 | `-p` | `1` | Penalty applied to domain hit group prevent FP read classifications |
 | `-f` | off | Enable multithreaded gzip decompression. Recommended for short-read (50-100bp) |
 | `-c` | off | Output per-accession total and unique hit counts to .strain.txt |
-| `--no-output` | off | only generates .report |
+| `--no-output` | off | skip the per-read .output file (with `-a` this requires `-c`) |
 
 
 
