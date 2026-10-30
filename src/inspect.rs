@@ -33,7 +33,7 @@ pub fn run_inspect(config: InspectConfig) -> Result<()> {
         .enumerate()
         .filter(|(_, &c)| c > 0)
         .map(|(i, &c)| {
-            let taxid = db.true_taxid(i as u8);
+            let taxid = db.true_taxid(i as crate::database::TaxIdx);
             let name = db.get_taxid_name(taxid);
             (taxid, name, c)
         })

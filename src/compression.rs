@@ -37,18 +37,6 @@ pub fn delta_vbyte_encode(sorted_ids: &[u32]) -> Vec<u8> {
     out
 }
 
-pub fn delta_vbyte_decode(data: &[u8], pos: &mut usize) -> Vec<u32> {
-    let count = vbyte_decode(data, pos) as usize;
-    let mut result = Vec::with_capacity(count);
-    let mut prev = 0u32;
-    for _ in 0..count {
-        let delta = vbyte_decode(data, pos);
-        prev += delta;
-        result.push(prev);
-    }
-    result
-}
-
 #[inline]
 pub fn delta_vbyte_skip(data: &[u8], pos: &mut usize) {
     let count = vbyte_decode(data, pos) as usize;

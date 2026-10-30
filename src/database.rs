@@ -5,9 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use boomphf::Mphf;
 use rustc_hash::FxHashMap;
-use crate::hash::compute_fingerprint;
-use crate::taxonomy::resolve_domain_lca;
-use crate::compression::{delta_vbyte_decode, delta_vbyte_encode, delta_vbyte_skip, vbyte_decode};
+use crate::compression::{delta_vbyte_encode, delta_vbyte_skip, vbyte_decode};
 
 pub struct AccessionRegistry {
     name_to_id: HashMap<String, u32>,
@@ -67,12 +65,8 @@ impl AccessionRegistry {
     }
 }
 
-const RANK_BLOCK_BITS: usize = 512;
-const RANK_BLOCK_WORDS: usize = RANK_BLOCK_BITS / 64; 
-
 pub struct EqClassAccessions {
     bitset: Vec<u64>,
-    rank_cache: Vec<u32>,
     dense_ids: Vec<u32>,
     num_slots: usize,
     offsets: Vec<u32>,
@@ -86,54 +80,12 @@ impl EqClassAccessions {
         let encoded_empty = delta_vbyte_encode(&[]);
         Self {
             bitset: vec![0u64; num_words],
-            rank_cache: Vec::new(),
             dense_ids: Vec::new(),
             num_slots,
             offsets: vec![0u32],
             blob: encoded_empty,
             num_classes: 1,
         }
-    }
-
-    fn build_rank_cache(&mut self) {
-        let num_blocks = (self.bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
-        self.rank_cache = Vec::with_capacity(num_blocks + 1);
-        let mut cumulative: u32 = 0;
-        for block in 0..num_blocks {
-            self.rank_cache.push(cumulative);
-            let start = block * RANK_BLOCK_WORDS;
-            let end = (start + RANK_BLOCK_WORDS).min(self.bitset.len());
-            for w in start..end {
-                cumulative += self.bitset[w].count_ones();
-            }
-        }
-        self.rank_cache.push(cumulative);
-    }
-
-    #[inline]
-    fn rank(&self, idx: usize) -> usize {
-        let word = idx / 64;
-        let bit = idx % 64;
-        let block = word / RANK_BLOCK_WORDS;
-        let mut r = self.rank_cache[block] as usize;
-        let block_start = block * RANK_BLOCK_WORDS;
-        for w in block_start..word {
-            r += self.bitset[w].count_ones() as usize;
-        }
-        if bit > 0 {
-            r += (self.bitset[word] & ((1u64 << bit) - 1)).count_ones() as usize;
-        }
-        r
-    }
-
-    #[inline]
-    fn has_bit(&self, idx: usize) -> bool {
-        let word = idx / 64;
-        let bit = idx % 64;
-        if word >= self.bitset.len() {
-            return false;
-        }
-        self.bitset[word] & (1u64 << bit) != 0
     }
 
     #[inline]
@@ -214,42 +166,10 @@ impl EqClassAccessions {
                 word &= word - 1;
             }
         }
-
-        self.build_rank_cache();
     }
 
-    #[inline]
-    pub fn get_class_id(&self, idx: usize) -> Option<u32> {
-        if !self.has_bit(idx) {
-            return None;
-        }
-        let dense_pos = self.rank(idx);
-        Some(self.dense_ids[dense_pos])
-    }
-
-    // get_class_id, but also returns the dense position 
-    #[inline]
-    pub fn get_class_id_with_pos(&self, idx: usize) -> Option<(u32, u32)> {
-        if !self.has_bit(idx) {
-            return None;
-        }
-        let dense_pos = self.rank(idx);
-        Some((self.dense_ids[dense_pos], dense_pos as u32))
-    }
-
-    #[inline]
-    pub fn num_dense(&self) -> usize {
-        self.dense_ids.len()
-    }
-
-    // this is class ID to actual accession IDs
-    pub fn decode_class(&self, class_id: u32) -> Vec<u32> {
-        let cid = class_id as usize;
-        if cid == 0 || cid >= self.num_classes {
-            return Vec::new();
-        }
-        let mut pos = self.offsets[cid] as usize;
-        delta_vbyte_decode(&self.blob, &mut pos)
+    pub fn into_parts(self) -> (Vec<u64>, Vec<u32>, Vec<u32>, Vec<u8>, usize) {
+        (self.bitset, self.dense_ids, self.offsets, self.blob, self.num_classes)
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
@@ -363,22 +283,8 @@ impl EqClassAccessions {
             delta_vbyte_skip(&blob, &mut bpos);
         }
 
-        let num_blocks = (bitset.len() + RANK_BLOCK_WORDS - 1) / RANK_BLOCK_WORDS;
-        let mut rank_cache = Vec::with_capacity(num_blocks + 1);
-        let mut cumulative: u32 = 0;
-        for block in 0..num_blocks {
-            rank_cache.push(cumulative);
-            let start = block * RANK_BLOCK_WORDS;
-            let end = (start + RANK_BLOCK_WORDS).min(bitset.len());
-            for w in start..end {
-                cumulative += bitset[w].count_ones();
-            }
-        }
-        rank_cache.push(cumulative);
-
         Ok(Self {
             bitset,
-            rank_cache,
             dense_ids,
             num_slots,
             offsets,
@@ -388,7 +294,6 @@ impl EqClassAccessions {
     }
 }
 
-
 pub struct KmerDatabase {
     pub k: usize,
     pub l: usize,
@@ -397,7 +302,7 @@ pub struct KmerDatabase {
     num_minimizers: usize,
     mphf: Mphf<u64>,
     fingerprints: Vec<u16>,
-    taxid_indices: Vec<u8>,
+    taxid_indices: Vec<TaxIdx>,
     pub index_to_taxid: Vec<u32>,
     pub ancestor_matrix: Vec<u8>,
     accessions: Option<EqClassAccessions>,
@@ -415,7 +320,7 @@ impl KmerDatabase {
         num_minimizers: usize,
         mphf: Mphf<u64>,
         fingerprints: Vec<u16>,
-        taxid_indices: Vec<u8>,
+        taxid_indices: Vec<TaxIdx>,
         index_to_taxid: Vec<u32>,
         ancestor_matrix: Vec<u8>,
         accessions: Option<EqClassAccessions>,
@@ -428,37 +333,8 @@ impl KmerDatabase {
         }
     }
 
-    pub fn true_taxid(&self, idx: u8) -> u32 {
+    pub fn true_taxid(&self, idx: TaxIdx) -> u32 {
         self.index_to_taxid.get(idx as usize).copied().unwrap_or(0)
-    }
-
-    pub fn k(&self) -> usize { self.k }
-    pub fn l(&self) -> usize { self.l }
-
-    #[inline(always)]
-    pub fn is_ancestor(&self, ancestor_idx: u8, descendant_idx: u8) -> bool {
-        let n = self.index_to_taxid.len();
-        let a = ancestor_idx as usize;
-        let d = descendant_idx as usize;
-        if a >= n || d >= n { return false; }
-        self.ancestor_matrix[a * n + d] != 0
-    }
-
-    pub fn resolve_accessions(&self, class_id: u32) -> Vec<u32> {
-        match self.accessions {
-            Some(ref acc) => acc.decode_class(class_id),
-            None => Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn accessions_ref(&self) -> Option<&EqClassAccessions> {
-        self.accessions.as_ref()
-    }
-
-    #[inline(always)]
-    pub fn get_taxid_index(&self, taxid: u32) -> Option<u8> {
-        self.index_to_taxid.iter().position(|&t| t == taxid).map(|p| p as u8)
     }
 
     pub fn get_taxid_name(&self, taxid: u32) -> String {
@@ -474,105 +350,8 @@ impl KmerDatabase {
         "Unknown".to_string()
     }
     
-    pub fn taxid_indices(&self) -> &[u8] {
+    pub fn taxid_indices(&self) -> &[TaxIdx] {
         &self.taxid_indices
-    }
-
-    pub fn query_into(
-        &self,
-        scanner: &crate::minimizer::MinimizerScanner,
-        seq: &[u8],
-        minimizer_buf: &mut Vec<u64>,
-        out: &mut Vec<Hit>,
-        bg_filters: &[(DomainBloomFilter, u32)],
-    ) {
-        scanner.scan_into(seq, minimizer_buf);
-        out.reserve(minimizer_buf.len());
-        
-        let acc_ref = self.accessions.as_ref();
-        
-        let mut last_m = u64::MAX;
-        let mut last_hit = Hit { 
-            taxid_idx: 0, 
-            accession_class_id: None,
-            accession_dense_pos: None,
-            is_hit: false, 
-            bg_taxid: 0 
-        };
-
-        for &m in minimizer_buf.iter() {
-            if m == u64::MAX {
-                out.push(Hit {
-                    taxid_idx: 0,
-                    accession_class_id: None,
-                    accession_dense_pos: None,
-                    is_hit: false,
-                    bg_taxid: 0,
-                });
-                last_m = u64::MAX;
-                continue;
-            }
-
-            if m == last_m {
-                out.push(last_hit);
-                continue;
-            }
-
-            last_m = m;
-            let mut is_hit = false;
-            let mut hit_idx = 0;
-
-            if let Some(idx_u64) = self.mphf.try_hash(&m) {
-                let idx = idx_u64 as usize;
-                if idx < self.num_minimizers && self.fingerprints[idx] == compute_fingerprint(m) {
-                    is_hit = true;
-                    hit_idx = idx;
-                }
-            }
-
-            let new_hit = if is_hit {
-                let (class_id_opt, dense_pos_opt) = match acc_ref.and_then(|a| a.get_class_id_with_pos(hit_idx)) {
-                    Some((cid, dp)) => (Some(cid), Some(dp)),
-                    None => (None, None),
-                };
-                Hit {
-                    taxid_idx: self.taxid_indices[hit_idx],
-                    accession_class_id: class_id_opt,
-                    accession_dense_pos: dense_pos_opt,
-                    is_hit: true,
-                    bg_taxid: 0,
-                }
-            } else {
-                let mut hit_taxids = [0u32; 4]; 
-                let mut match_count = 0;
-
-                for (filter, t_id) in bg_filters {
-                    if filter.contains(m) {
-                        if match_count < 4 {
-                            hit_taxids[match_count] = *t_id;
-                        }
-                        match_count += 1;
-                    }
-                }
-
-                let bg_taxid = match match_count {
-                    0 => 0,
-                    1 => hit_taxids[0], 
-                    _ => resolve_domain_lca(hit_taxids[..match_count.min(4)].iter()),
-                };
-
-                Hit { 
-                    taxid_idx: 0, 
-                    accession_class_id: None,
-                    accession_dense_pos: None,
-                    is_hit: false, 
-                    bg_taxid 
-                }
-            };
-
-            last_hit = new_hit;
-            out.push(new_hit);
-        }
     }
 
     pub fn save(&self, prefix: &str) -> Result<()> {
@@ -585,6 +364,7 @@ impl KmerDatabase {
             w.write_all(&self.toggle_mask.to_le_bytes())?;
             w.write_all(&(self.num_minimizers as u64).to_le_bytes())?;
             w.write_all(&[self.accessions.is_some() as u8])?;
+            w.write_all(&[taxid_width(self.index_to_taxid.len()) as u8])?;
             w.flush()?;
         }
         // .mphf
@@ -604,10 +384,21 @@ impl KmerDatabase {
             w.write_all(fp_bytes)?;
             w.flush()?;
         }
-        // .taxid - this is in u8 btw
         {
             let mut w = BufWriter::new(File::create(format!("{}.taxid", prefix))?);
-            w.write_all(&self.taxid_indices)?;
+            if taxid_width(self.index_to_taxid.len()) == 1 {
+                let bytes: Vec<u8> = self.taxid_indices.iter().map(|&t| t as u8).collect();
+
+                w.write_all(&bytes)?;
+            } else {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        self.taxid_indices.as_ptr() as *const u8,
+                        self.taxid_indices.len() * 2,
+                    )
+                };
+                w.write_all(bytes)?;
+            }
             w.flush()?;
         }
         // .taxmap - binary
@@ -636,22 +427,7 @@ impl KmerDatabase {
     pub fn load(prefix: &str, load_accessions: bool) -> Result<Self> {
         eprintln!("Loading database from {}", prefix);
 
-        // .meta
-        let (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc) = {
-            let mut f = File::open(format!("{}.meta", prefix))
-                .context("Cannot open .meta file")?;
-            let mut buf4 = [0u8; 4];
-            let mut buf8 = [0u8; 8];
-            let mut buf1 = [0u8; 1];
-
-            f.read_exact(&mut buf4)?; let k = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf4)?; let l = u32::from_le_bytes(buf4) as usize;
-            f.read_exact(&mut buf8)?; let spaced_seed_mask = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?; let toggle_mask = u64::from_le_bytes(buf8);
-            f.read_exact(&mut buf8)?; let num_minimizers = u64::from_le_bytes(buf8) as usize;
-            f.read_exact(&mut buf1)?; let has_acc = buf1[0] == 1;
-            (k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc)
-        };
+        let MetaHeader { k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc, taxid_width: meta_width } = read_meta(prefix)?;
 
         // .mphf
        let mphf: Mphf<u64> = {
@@ -671,53 +447,21 @@ impl KmerDatabase {
             fp
         };
 
-        // .taxid
         let taxid_indices = {
             let mut f = File::open(format!("{}.taxid", prefix)).context("Cannot open .taxid file")?;
-            let mut v = vec![0u8; num_minimizers];
-            f.read_exact(&mut v)?;
-            v
-        };
-
-        // .taxmap
-        let (index_to_taxid, ancestor_matrix) = {
-            let mut f = File::open(format!("{}.taxmap", prefix)).context("Cannot open .taxmap file")?;
-            let mut buf8 = [0u8; 8];
-            f.read_exact(&mut buf8)?;
-            let sz = u64::from_le_bytes(buf8) as usize;
-            let mut v = vec![0u32; sz];
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, sz * 4)
-            };
-            f.read_exact(byte_slice)?;
-            
-            let mut anc = vec![0u8; sz * sz];
-            if let Err(_) = f.read_exact(&mut anc) {
-                anc.fill(0);
-            }
-            (v, anc)
-        };
-
-        // .names
-        let names_map = {
-            let path = format!("{}.names", prefix);
-            if let Ok(file) = File::open(&path) {
-                use std::io::BufRead;
-                let reader = BufReader::new(file);
-                let mut map = rustc_hash::FxHashMap::default();
-                for line in reader.lines().flatten() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() == 2 {
-                        if let Ok(taxid) = parts[0].parse::<u32>() {
-                            map.insert(taxid, parts[1].to_string());
-                        }
-                    }
-                }
-                Some(map)
+            let width = infer_taxid_width(f.metadata()?.len(), num_minimizers)?;
+            check_taxid_width(meta_width, width)?;
+            let mut raw = vec![0u8; num_minimizers * width];
+            f.read_exact(&mut raw)?;
+            if width == 1 {
+                raw.into_iter().map(|b| b as TaxIdx).collect::<Vec<_>>()
             } else {
-                None
+                raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
             }
         };
+
+        let (index_to_taxid, ancestor_matrix) = read_taxmap(prefix)?;
+        let names_map = read_names(prefix);
 
         let acc_path = format!("{}.accession", prefix);
         let accessions = if load_accessions && has_acc && Path::new(&acc_path).exists() {
@@ -732,6 +476,98 @@ impl KmerDatabase {
     }
 }
 
+pub struct MetaHeader {
+    pub k: usize,
+    pub l: usize,
+    pub spaced_seed_mask: u64,
+    pub toggle_mask: u64,
+    pub num_minimizers: usize,
+    pub has_acc: bool,
+    pub taxid_width: usize,
+}
+
+pub fn read_meta(prefix: &str) -> Result<MetaHeader> {
+    let mut f = File::open(format!("{}.meta", prefix)).context("Cannot open .meta file")?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+    let mut buf1 = [0u8; 1];
+    f.read_exact(&mut buf4)?; let k = u32::from_le_bytes(buf4) as usize;
+    f.read_exact(&mut buf4)?; let l = u32::from_le_bytes(buf4) as usize;
+    f.read_exact(&mut buf8)?; let spaced_seed_mask = u64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8)?; let toggle_mask = u64::from_le_bytes(buf8);
+    f.read_exact(&mut buf8)?; let num_minimizers = u64::from_le_bytes(buf8) as usize;
+    f.read_exact(&mut buf1)?; let has_acc = buf1[0] == 1;
+    let taxid_width = read_meta_taxid_width(&mut f)?;
+    Ok(MetaHeader { k, l, spaced_seed_mask, toggle_mask, num_minimizers, has_acc, taxid_width })
+}
+
+pub fn read_taxmap(prefix: &str) -> Result<(Vec<u32>, Vec<u8>)> {
+    let mut f = File::open(format!("{}.taxmap", prefix)).context("Cannot open .taxmap file")?;
+    let mut all = Vec::new();
+    f.read_to_end(&mut all)?;
+    if all.len() < 8 {
+        anyhow::bail!(".taxmap is truncated");
+    }
+    let sz = u64::from_le_bytes(all[0..8].try_into().unwrap()) as usize;
+    if all.len() < 8 + sz * 4 {
+        anyhow::bail!(".taxmap is truncated");
+    }
+    let v: Vec<u32> = all[8..8 + sz * 4].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let mut anc = vec![0u8; sz * sz];
+    let rest = &all[8 + sz * 4..];
+    if rest.len() >= sz * sz {
+        anc.copy_from_slice(&rest[..sz * sz]);
+    }
+    Ok((v, anc))
+}
+
+pub fn read_names(prefix: &str) -> Option<FxHashMap<u32, String>> {
+    let file = File::open(format!("{}.names", prefix)).ok()?;
+    let mut map = FxHashMap::default();
+    for line in BufReader::new(file).lines().flatten() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() == 2 {
+            if let Ok(taxid) = parts[0].parse::<u32>() {
+                map.insert(taxid, parts[1].to_string());
+            }
+        }
+    }
+    Some(map)
+}
+
+pub type TaxIdx = u16;
+pub const MAX_TAXA: usize = 65_536;
+
+#[inline]
+pub fn taxid_width(num_taxa: usize) -> usize {
+    if num_taxa <= 256 { 1 } else { 2 }
+}
+
+pub fn read_meta_taxid_width<R: Read>(f: &mut R) -> Result<usize> {
+    let mut b = [0u8; 1];
+    match f.read(&mut b)? {
+        0 => Ok(1),
+        _ => match b[0] {
+            1 => Ok(1),
+            2 => Ok(2),
+            x => anyhow::bail!(".meta taxid width byte is {}, expected 1 or 2", x),
+        },
+    }
+}
+
+pub fn check_taxid_width(meta_width: usize, file_width: usize) -> Result<()> {
+    if meta_width != file_width {
+        anyhow::bail!(".meta says {} byte(s) per taxid but .taxid size implies {}", meta_width, file_width);
+    }
+    Ok(())
+}
+
+pub fn infer_taxid_width(file_len: u64, num_minimizers: usize) -> Result<usize> {
+    let n = num_minimizers as u64;
+    if file_len == n { Ok(1) }
+    else if file_len == n * 2 { Ok(2) }
+    else { anyhow::bail!(".taxid length {} is neither {} nor {} bytes (num_minimizers={})", file_len, n, n * 2, n) }
+}
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -767,11 +603,3 @@ impl DomainBloomFilter {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct Hit {
-    pub taxid_idx: u8,
-    pub accession_class_id: Option<u32>,
-    pub accession_dense_pos: Option<u32>,
-    pub is_hit: bool,
-    pub bg_taxid: u32, 
-}

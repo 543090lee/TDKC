@@ -9,6 +9,9 @@ mod build_domain;
 mod compression;
 mod hash;
 mod inspect;
+mod mphf;
+mod querydb;
+mod pgz;
 use clap::{Parser, Subcommand};
 use anyhow::Context;
 
@@ -102,6 +105,10 @@ enum Commands {
         #[arg(long, help = "only generates .report")]
         no_output: bool,
 
+        #[arg(short = 'z', long = "gzip-output", conflicts_with = "no_output",
+              help = "write the per-read output gzip-compressed (.output.gz, multi-member gzip)")]
+        gzip_output: bool,
+
         #[arg(short = 'f', long, requires = "no_output")]
         fast_gzip_decompression: bool,
 
@@ -145,8 +152,7 @@ enum Commands {
 
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -160,7 +166,8 @@ async fn main() -> anyhow::Result<()> {
             custom,
             no_mask,
         } => {
-            prep::run_prep(prep::PrepConfig {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(prep::run_prep(prep::PrepConfig {
                 domains,
                 targets_file: targets,
                 db_dir: db,
@@ -169,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                 in_flight_chunks,
                 custom_fasta: custom,
                 no_mask,
-            }).await?;
+            }))?;
         }
 
         Commands::Build {
@@ -226,6 +233,7 @@ async fn main() -> anyhow::Result<()> {
             output_prefix,
             background,
             no_output,
+            gzip_output,
             fast_gzip_decompression,
             domain_penalty,
             counts,
@@ -260,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
                 output_prefix,
                 background,
                 no_output,
+                gzip_output,
                 gzip_multithreaded: fast_gzip_decompression,
                 domain_penalty,
                 counts,

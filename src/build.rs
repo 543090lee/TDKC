@@ -8,6 +8,7 @@ use rustc_hash::FxHashMap;
 use crate::database::{AccessionRegistry, EqClassAccessions, KmerDatabase};
 use crate::minimizer::{create_spaced_seed_mask, MinimizerScanner, SPACED_PATTERN, TOGGLE_MASK};
 use crate::prep::load_prelim_map;
+use crate::database::TaxIdx;
 use crate::taxonomy::{load_target_taxids, BfsTaxonomy, TargetTaxIDManager, TaxonomyTree};
 use crate::utils::{init_thread_pool,segment_ranges};
 use crate::hash::compute_fingerprint;
@@ -30,7 +31,8 @@ const NUM_SHARDS: usize = 256;
 const SHARD_SHIFT: usize = 56;
 const BATCH_ITEM_LIMIT: usize = 2048;
 const BATCH_BYTE_LIMIT: usize = 256 * 1024 * 1024;
-const PAR_CHUNK_SIZE: usize = 64;
+const EXTRACT_CHUNK_SIZE: usize = 4;
+const CHALLENGE_CHUNK_SIZE: usize = 1;
 const SEG_TARGET_LEN: usize = 4 * 1024 * 1024;
 
 pub fn run_build(config: BuildConfig) -> Result<()> {
@@ -94,6 +96,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     };
 
     eprintln!("\nExtracting target minimizers...");
+    let phase = Instant::now();
     let global = ShardedMinimizerMap::new();
 
     extract_target_minimizers(
@@ -113,7 +116,9 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         .map(|s| s.read().unwrap().len())
         .sum();
 
+    eprintln!("  [extract] {:.1}s", phase.elapsed().as_secs_f64());
     eprintln!("\nChallenging minimizers...");
+    let phase = Instant::now();
     let to_remove = collect_background_hits(
         &config.fasta_files,
         &target_accessions,
@@ -126,6 +131,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
 
     challenge_bulk_remove(&global, &to_remove);
     drop(to_remove);
+    eprintln!("  [challenge] {:.1}s", phase.elapsed().as_secs_f64());
 
     let total_surviving: usize = global
         .shards
@@ -150,7 +156,9 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         config.track_accessions,
     )?;
 
+    let phase = Instant::now();
     db.save(&config.db_prefix)?;
+    eprintln!("  [save] {:.1}s", phase.elapsed().as_secs_f64());
 
     if let Some(reg) = accession_registry {
         reg.save(&format!("{}.accessions", config.db_prefix))?;
@@ -207,10 +215,10 @@ fn build_database_from_shards(
     eprintln!("Found {} unique taxIDs", unique_taxids.len());
     eprintln!("{} unique minimizers", num_minimizers);
 
-    if unique_taxids.len() > 255 {
+    if unique_taxids.len() > crate::database::MAX_TAXA {
         anyhow::bail!(
-            "Too many unique taxids ({}) for u8 storage (max 255)",
-            unique_taxids.len()
+            "Too many unique taxids ({}) for u16 storage (max {})",
+            unique_taxids.len(), crate::database::MAX_TAXA
         );
     }
     if num_minimizers == 0 {
@@ -218,10 +226,10 @@ fn build_database_from_shards(
     }
 
     let mut index_to_taxid: Vec<u32> = Vec::new();
-    let mut taxid_to_index: HashMap<u32, u8> = HashMap::new();
+    let mut taxid_to_index: HashMap<u32, TaxIdx> = HashMap::new();
     for (i, &taxid) in unique_taxids.iter().enumerate() {
         index_to_taxid.push(taxid);
-        taxid_to_index.insert(taxid, i as u8);
+        taxid_to_index.insert(taxid, i as TaxIdx);
     }
     let n = index_to_taxid.len();
     let mut ancestor_matrix = vec![0u8; n * n];
@@ -250,44 +258,67 @@ fn build_database_from_shards(
     }
 
     eprintln!("Building MPHF...");
-    let mphf = Mphf::new(2.0, &keys);
+    let phase = Instant::now();
+    let mphf = Mphf::new_parallel(2.0, &keys, None);
     drop(keys);
+    eprintln!("  [mphf] {:.1}s", phase.elapsed().as_secs_f64());
 
     eprintln!("\nPopulating arrays...");
+    let phase = Instant::now();
     let mut fingerprints = vec![0u16; num_minimizers];
-    let mut taxid_indices = vec![0u8; num_minimizers];
+    let mut taxid_indices: Vec<TaxIdx> = vec![0; num_minimizers];
     let mut accessions = track_accessions
         .then(|| EqClassAccessions::new_empty(num_minimizers));
     let mut hash_to_class: FxHashMap<u64, u32> = FxHashMap::default();
     let mut build_map: FxHashMap<u32, u32> = FxHashMap::default();
 
-    for (shard_idx, shard_lock) in global.shards.into_iter().enumerate() {
-        let shard = shard_lock.into_inner().unwrap();
-
-        for (minimizer, entry) in shard {
-            if !bfs_tax.is_relevant(entry.int_taxid) {
-                continue;
-            }
-
-            let ext_taxid = bfs_tax.to_external(entry.int_taxid);
-            let report_taxid = taxid_manager.get_target(ext_taxid).unwrap_or(ext_taxid);
-
-            let idx = mphf.hash(&minimizer) as usize;
-            if idx >= num_minimizers {
-                continue;
-            }
-
-            fingerprints[idx] = compute_fingerprint(minimizer);
-            taxid_indices[idx] = taxid_to_index[&report_taxid];
-
-            if let Some(ref mut acc) = accessions {
-                if let Some(mut boxed_vec) = entry.accession_ids {
-                    if !boxed_vec.is_empty() {
-                        boxed_vec.sort_unstable();
-                        boxed_vec.dedup();
-                        acc.add_accessions(idx, &boxed_vec, &mut hash_to_class, &mut build_map);
+    struct SyncPtr<T>(*mut T);
+    unsafe impl<T> Send for SyncPtr<T> {}
+    unsafe impl<T> Sync for SyncPtr<T> {}
+    let fp_ptr = SyncPtr(fingerprints.as_mut_ptr());
+    let tx_ptr = SyncPtr(taxid_indices.as_mut_ptr());
+    let shards: Vec<FxHashMap<u64, BuildEntry>> = global
+        .shards
+        .into_iter()
+        .map(|l| l.into_inner().unwrap())
+        .collect();
+    let acc_lists: Vec<Vec<(usize, Box<Vec<u32>>)>> = shards
+        .into_par_iter()
+        .map(|shard| {
+            let (fp_ptr, tx_ptr) = (&fp_ptr, &tx_ptr);
+            let mut local: Vec<(usize, Box<Vec<u32>>)> = Vec::new();
+            for (minimizer, entry) in shard {
+                if !bfs_tax.is_relevant(entry.int_taxid) {
+                    continue;
+                }
+                let ext_taxid = bfs_tax.to_external(entry.int_taxid);
+                let report_taxid = taxid_manager.get_target(ext_taxid).unwrap_or(ext_taxid);
+                let idx = mphf.hash(&minimizer) as usize;
+                if idx >= num_minimizers {
+                    continue;
+                }
+                unsafe {
+                    *fp_ptr.0.add(idx) = compute_fingerprint(minimizer);
+                    *tx_ptr.0.add(idx) = taxid_to_index[&report_taxid];
+                }
+                if track_accessions {
+                    if let Some(boxed_vec) = entry.accession_ids {
+                        if !boxed_vec.is_empty() {
+                            local.push((idx, boxed_vec));
+                        }
                     }
                 }
+            }
+            local
+        })
+        .collect();
+
+    if let Some(ref mut acc) = accessions {
+        for list in acc_lists {
+            for (idx, mut boxed_vec) in list {
+                boxed_vec.sort_unstable();
+                boxed_vec.dedup();
+                acc.add_accessions(idx, &boxed_vec, &mut hash_to_class, &mut build_map);
             }
         }
     }
@@ -300,6 +331,7 @@ fn build_database_from_shards(
         drop(build_map);
     }
 
+    eprintln!("  [populate] {:.1}s", phase.elapsed().as_secs_f64());
     eprintln!("\nDone building in {:.2}s", start.elapsed().as_secs_f64());
 
     Ok(KmerDatabase::new(
@@ -319,6 +351,7 @@ fn build_database_from_shards(
 }
 
 fn presort_accessions_by_lineage(
+
     target_accessions: &HashSet<String>,
     acc_to_taxid: &FxHashMap<String, u32>,
     taxonomy: &TaxonomyTree,
@@ -350,7 +383,6 @@ fn presort_accessions_by_lineage(
     }
     Ok(registry)
 }
-
 
 struct BuildEntry {
     int_taxid: u32,
@@ -542,7 +574,7 @@ fn extract_target_minimizers(
     });
 
     for (work_items, acc_records) in rx {
-        work_items.par_chunks(PAR_CHUNK_SIZE).for_each(|chunk| {
+        work_items.par_chunks(EXTRACT_CHUNK_SIZE).for_each(|chunk| {
             let mut accum = LocalShardAccum::new();
             let mut minimizer_buf: Vec<u64> = Vec::new();
 
@@ -679,9 +711,13 @@ fn collect_background_hits(
 
     let mut all_hits: Vec<u64> = Vec::new();
 
+    let shard_guards: Vec<std::sync::RwLockReadGuard<'_, FxHashMap<u64, BuildEntry>>> =
+        global.shards.iter().map(|s| s.read().unwrap()).collect();
+    let guards = &shard_guards;
+
     for work_items in rx {
         let batch_hits: Vec<u64> = work_items
-            .par_chunks(PAR_CHUNK_SIZE)
+            .par_chunks(CHALLENGE_CHUNK_SIZE)
             .fold(
                 || Vec::new(),
                 |mut local_hits: Vec<u64>, chunk: &[ChallengeSegment]| {
@@ -690,14 +726,13 @@ fn collect_background_hits(
                     for item in chunk {
                         scanner.scan_into(item.seq_slice(), &mut minimizer_buf);
                         for &m in &minimizer_buf {
-                            if m != u64::MAX {
-                                let shard = global.shards[shard_for(m)].read().unwrap();
-                                if shard.contains_key(&m) {
-                                    local_hits.push(m);
-                                }
+                            if m != u64::MAX && guards[shard_for(m)].contains_key(&m) {
+                                local_hits.push(m);
                             }
                         }
                     }
+                    local_hits.sort_unstable();
+                    local_hits.dedup();
                     local_hits
                 },
             )
@@ -715,7 +750,12 @@ fn collect_background_hits(
             );
 
         all_hits.extend(batch_hits);
+        if all_hits.len() > (1 << 27) {
+            all_hits.sort_unstable();
+            all_hits.dedup();
+        }
     }
+    drop(shard_guards);
 
     match reader_handle.join() {
         Ok(Ok(())) => {}

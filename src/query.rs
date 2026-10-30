@@ -1,17 +1,17 @@
 pub mod read_finder;
-use std::collections::HashMap;
+use crate::database::TaxIdx;
 use std::io::{self, Write, BufReader};
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
-use crate::database::{AccessionRegistry, DomainBloomFilter, KmerDatabase, Hit};
+use crate::database::{AccessionRegistry, DomainBloomFilter};
+use crate::querydb::{Lookup, QueryDb};
 use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
-use itertools::Itertools;
 use crate::utils::init_thread_pool;
-use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, TAXID_ROOT, TAXID_CELLULAR};
+use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL};
 use read_finder::Sample;
 use std::process::{Command, Stdio};
 
@@ -24,6 +24,7 @@ pub struct QueryConfig {
     pub minimum_hit_groups: usize,
     pub output_prefix: String,
     pub no_output: bool,
+    pub gzip_output: bool,
     pub gzip_multithreaded: bool,
     pub domain_penalty: usize,
     pub counts: bool,
@@ -67,7 +68,7 @@ impl SeenBitset {
 // this goes to writer thread
 struct BatchResult {
     output_data: Vec<u8>,
-    report_counts: FxHashMap<u32, usize>,
+    report_counts: Vec<usize>,
     acc_counts: AccCountMap,
     classified: usize,
     unclassified: usize,
@@ -75,11 +76,13 @@ struct BatchResult {
     num_records: usize,
 }
 
+const GROUP: usize = 8;
+
 pub fn run_query(config: QueryConfig) -> Result<()> {
     init_thread_pool(config.threads);
 
     let db_prefix = format!("{}/db", config.db_dir);
-    let db = KmerDatabase::load(&db_prefix, config.use_accessions)?;
+    let db = QueryDb::load(&db_prefix, config.use_accessions)?;
 
     let mut bg_filters = Vec::new();
     if config.background {
@@ -115,16 +118,28 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         None
     };
 
-    if config.counts && (acc_registry.is_none() || db.accessions_ref().is_none()) {
+    if config.counts && (acc_registry.is_none() || db.accessions.is_none()) {
         anyhow::bail!("--counts requires an accession database");
     }
 
-    let scanner = MinimizerScanner::new(db.k(),db.l(),db.spaced_seed_mask,db.toggle_mask);
+    let scanner = MinimizerScanner::new(db.k, db.l, db.spaced_seed_mask, db.toggle_mask);
     let classify_start = std::time::Instant::now();
     let num_samples = config.samples.len();
+    let n_taxa = db.index_to_taxid.len();
+
+    let ctx = ClassifyCtx {
+        db: &db,
+        scanner: &scanner,
+        acc_registry: acc_registry.as_ref(),
+        min_hit_groups: config.minimum_hit_groups,
+        bg_filters: &bg_filters,
+        no_output: config.no_output,
+        gzip_output: config.gzip_output,
+        domain_penalty: config.domain_penalty,
+    };
 
     // Takes in either single FASTQ file or a dir of FASTQ files
-    for sample in config.samples {
+    for sample in &config.samples {
         let is_paired = sample.r2.is_some();
         let r1_path = sample.r1.to_string_lossy().to_string();
         let r2_path = sample.r2.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -140,10 +155,11 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
         eprintln!();
         let no_output = config.no_output;
+        let output_ext = if config.gzip_output { ".output.gz" } else { ".output" };
         let out_prefix_clone = out_prefix.clone();
 
         let seen_bits: Option<Arc<SeenBitset>> = if config.counts {
-            db.accessions_ref().map(|acc| Arc::new(SeenBitset::new(acc.num_dense())))
+            db.accessions.as_ref().map(|acc| Arc::new(SeenBitset::new(acc.num_dense())))
         } else {
             None
         };
@@ -154,17 +170,17 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<BatchResult>(config.threads * 4);
         let want_counts = config.counts;
         // writer thread will act as a mutex, but without contention
-        let writer_handle = std::thread::spawn(move || -> Result<(HashMap<u32, usize>, AccCountMap, usize, usize, usize, usize)> {
+        let writer_handle = std::thread::spawn(move || -> Result<(Vec<usize>, AccCountMap, usize, usize, usize, usize)> {
             //now dont have to worry about flushing it out, since BufWriter will automatically write to disk and reset
             //when it;s full
             let mut writer = if !no_output {
-                let output_file = File::create(format!("{}.output", out_prefix_clone))?;
+                let output_file = File::create(format!("{}{}", out_prefix_clone, output_ext))?;
                 Some(io::BufWriter::with_capacity(4 * 1024 * 1024, output_file))
             } else {
                 None
             };
 
-            let mut global_report: HashMap<u32, usize> = HashMap::new();
+            let mut global_report: Vec<usize> = vec![0; n_taxa + 1];
             let mut global_acc_counts: AccCountMap = FxHashMap::default();
             // I could use AtomicUsize for these, since these are single values, but too lazy
             let mut total_c: usize = 0;
@@ -176,8 +192,8 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 if let Some(ref mut w) = writer {
                     w.write_all(&batch.output_data)?;
                 }
-                for (taxid, count) in batch.report_counts {
-                    *global_report.entry(taxid).or_default() += count;
+                for (slot, count) in global_report.iter_mut().zip(batch.report_counts.iter()) {
+                    *slot += *count;
                 }
                 if want_counts {
                     for (acc_id, (total, uniq)) in batch.acc_counts {
@@ -200,15 +216,17 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
         let batch_size = 5_000;
         // by doing this, reader keep pushes batches into crossbeam channel, and bridge lets each rayon worker
-        // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had 
+        // grab one batch whenever it's free (mpmc), so no contention like before, where if one thread slow, then all had
         // to wait before starting on the nextc chunk (mpsc)
         let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
 
+        let gz_threads = if is_paired { (config.threads / 2).clamp(1, 4) } else { config.threads.clamp(1, 4) };
+        let gzip_multithreaded = config.gzip_multithreaded;
         let reader_handle = std::thread::spawn(move || -> Result<()> {
             if let Some(ref r2_path_str) = r2_path {
-                read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx, config.gzip_multithreaded)?;
+                read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx, gzip_multithreaded, gz_threads)?;
             } else {
-                read_single_batches(&r1_path, batch_size, &batch_tx, config.gzip_multithreaded)?;
+                read_single_batches(&r1_path, batch_size, &batch_tx, gzip_multithreaded, gz_threads)?;
             }
             // sender is done, so done reading (EOF)
             drop(batch_tx);
@@ -216,21 +234,14 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         });
 
         //par_bridge() let's channel to give batch to rayon thread whenever it's free
-        batch_rx.into_iter().par_bridge().for_each(|batch| {
-            let result = classify_batch(
-                &batch,
-                &db,
-                &scanner,
-                &acc_registry,
-                config.minimum_hit_groups,
-                is_paired,
-                &bg_filters,
-                config.no_output,
-                config.domain_penalty,
-                seen_bits.as_deref(),
-            );
-            let _ = writer_tx.send(result);
-        });
+        let seen_ref = seen_bits.as_deref();
+        batch_rx.into_iter().par_bridge().for_each_init(
+            || Scratch::new(n_taxa),
+            |scratch, batch| {
+                let result = classify_batch(&batch, &ctx, is_paired, seen_ref, scratch);
+                let _ = writer_tx.send(result);
+            },
+        );
 
         drop(writer_tx);
         let (global_report, global_acc_counts, c, u, a, num_records) = match writer_handle.join() {
@@ -249,8 +260,13 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         {
             let f = File::create(format!("{}.report", out_prefix))?;
             let mut writer = io::BufWriter::new(f);
-            let mut sorted: Vec<(u32, usize)> = global_report.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut sorted: Vec<(u32, usize)> = global_report
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(i, &c)| (if i == n_taxa { u32::MAX } else { db.index_to_taxid[i] }, c))
+                .collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
             writeln!(writer, "Target_TaxID\tName\tRead_Count\tRatio")?;
             for (taxid, count) in &sorted {
@@ -306,251 +322,318 @@ fn apply_penalty(hit_groups: usize, penalty: usize) -> usize {
     if hit_groups > penalty { hit_groups - penalty } else { 0 }
 }
 
+struct ClassifyCtx<'a> {
+    db: &'a QueryDb,
+    scanner: &'a MinimizerScanner,
+    acc_registry: Option<&'a AccessionRegistry>,
+    min_hit_groups: usize,
+    bg_filters: &'a [(DomainBloomFilter, u32)],
+    no_output: bool,
+    gzip_output: bool,
+    domain_penalty: usize,
+}
+
+struct Scratch {
+    minimizer_buf: Vec<u64>,
+    runs: Vec<(u64, u32)>,
+    run_lookup: Vec<u32>,
+    lookups: Vec<Lookup>,
+    lk_scratch: Vec<u32>,
+    spans: Vec<(u32, u32, u32, u32)>,
+    taxid_counts: Vec<u32>,
+    path_weights: Vec<u32>,
+    best: Vec<TaxIdx>,
+    cand: Vec<u64>,
+    acc_buf: Vec<u32>,
+    itoa: itoa::Buffer,
+}
+
+impl Scratch {
+    fn new(n_taxa: usize) -> Self {
+        Self {
+            minimizer_buf: Vec::with_capacity(512),
+            runs: Vec::with_capacity(GROUP * 128),
+            run_lookup: Vec::with_capacity(GROUP * 128),
+            lookups: Vec::with_capacity(GROUP * 128),
+            lk_scratch: Vec::with_capacity(GROUP * 128),
+            spans: Vec::with_capacity(GROUP),
+            taxid_counts: vec![0u32; n_taxa.max(1)],
+            path_weights: vec![0u32; n_taxa.max(1)],
+            best: Vec::with_capacity(n_taxa.max(1)),
+            cand: vec![0u64; (n_taxa.max(1) + 63) / 64],
+            acc_buf: Vec::new(),
+            itoa: itoa::Buffer::new(),
+        }
+    }
+}
+
+#[inline(always)]
+fn scan_append(scanner: &MinimizerScanner, seq: &[u8], sc: &mut Scratch) {
+    let mut buf = std::mem::take(&mut sc.minimizer_buf);
+    scanner.scan_into(seq, &mut buf);
+    let mut cur: u64 = 0;
+    let mut len: u32 = 0;
+    for &m in &buf {
+        if len > 0 && m == cur {
+            len += 1;
+            continue;
+        }
+        if len > 0 {
+            push_run(sc, cur, len);
+        }
+        cur = m;
+        len = 1;
+    }
+    if len > 0 {
+        push_run(sc, cur, len);
+    }
+    sc.minimizer_buf = buf;
+}
+
+#[inline(always)]
+fn push_run(sc: &mut Scratch, m: u64, len: u32) {
+    sc.runs.push((m, len));
+    if m == u64::MAX {
+        sc.run_lookup.push(u32::MAX);
+    } else {
+        sc.run_lookup.push(sc.lookups.len() as u32);
+        sc.lookups.push(Lookup::new(m));
+    }
+}
+
 // Tried not to use mutex here since it was keep giving me extra lock contention overhead
 // This was the main reason I switched to having a main writer thread
 #[inline(never)]
 fn classify_batch(
     batch: &ReadBatch,
-    db: &KmerDatabase,
-    scanner: &MinimizerScanner,
-    acc_registry: &Option<AccessionRegistry>,
-    min_hit_groups: usize,
+    ctx: &ClassifyCtx,
     is_paired: bool,
-    bg_filters: &[(DomainBloomFilter, u32)],
-    no_output: bool,
-    domain_penalty: usize,
     seen_bits: Option<&SeenBitset>,
+    sc: &mut Scratch,
 ) -> BatchResult {
+    let db = ctx.db;
     let batch_len = batch.batch1.offsets.len();
-    let mut local_output: Vec<u8> = if no_output { Vec::new() } else { Vec::with_capacity(batch_len * 200) };
-    let mut local_report: FxHashMap<u32, usize> = FxHashMap::default();
+    let n = db.index_to_taxid.len();
+    let mut local_output: Vec<u8> = if ctx.no_output { Vec::new() } else { Vec::with_capacity(batch_len * 160) };
+    let mut local_report: Vec<usize> = vec![0; n + 1];
     let mut local_acc_counts: AccCountMap = FxHashMap::default();
     let mut local_classified: usize = 0;
     let mut local_unclassified: usize = 0;
     let mut local_ambiguous: usize = 0;
 
-    let mut hits1: Vec<Hit> = Vec::new();
-    let mut hits2: Vec<Hit> = Vec::new();
-    let mut minimizer_buf1: Vec<u64> = Vec::new();
-    let mut minimizer_buf2: Vec<u64> = Vec::new();
+    let acc_for_counts = if seen_bits.is_some() { db.accessions.as_ref() } else { None };
+    let b1 = &batch.batch1;
+    let b2 = batch.batch2.as_ref();
 
-    let acc_ref_for_counts = seen_bits.and_then(|_| db.accessions_ref());
+    let mut g0 = 0usize;
+    while g0 < batch_len {
+        let g1 = (g0 + GROUP).min(batch_len);
 
-    // Helper that credits an accession-class for the very first time seen
-    let credit_class = |class_id: u32, dense_pos: u32, local_acc_counts: &mut AccCountMap| {
-        let (sb, acc) = match (seen_bits, acc_ref_for_counts) {
-            (Some(sb), Some(acc)) => (sb, acc),
-            _ => return,
-        };
-        if !sb.test_and_set(dense_pos) {
-            return; // some other thread already credited this minimizer
-        }
-        let accs = acc.decode_class(class_id);
-        let is_unique = accs.len() == 1;
-        for &a in &accs {
-            let slot = local_acc_counts.entry(a).or_insert((0, 0));
-            slot.0 = slot.0.saturating_add(1);
-            if is_unique {
-                slot.1 = slot.1.saturating_add(1);
-            }
-        }
-    };
-
-    for i in 0..batch_len {
-        let (h1_start, h1_end, s1_start, s1_end) = batch.batch1.offsets[i];
-        let header1 = &batch.batch1.data[h1_start..h1_end];
-        let seq1 = &batch.batch1.data[s1_start..s1_end];
-
-        hits1.clear();
-        db.query_into(scanner, seq1, &mut minimizer_buf1, &mut hits1, bg_filters);
-
-        let (seq2_len, has_r2) = if let Some(ref b2) = batch.batch2 {
-            let (_, _, s2_start, s2_end) = b2.offsets[i];
-            let seq2 = &b2.data[s2_start..s2_end];
-            hits2.clear();
-            db.query_into(scanner, seq2, &mut minimizer_buf2, &mut hits2, bg_filters);
-            (seq2.len(), true)
-        } else {
-            (0, false)
-        };
-
-        if seen_bits.is_some() {
-            for hit in hits1.iter() {
-                if let (Some(cid), Some(dp)) = (hit.accession_class_id, hit.accession_dense_pos) {
-                    credit_class(cid, dp, &mut local_acc_counts);
-                }
-            }
-            if has_r2 {
-                for hit in hits2.iter() {
-                    if let (Some(cid), Some(dp)) = (hit.accession_class_id, hit.accession_dense_pos) {
-                        credit_class(cid, dp, &mut local_acc_counts);
-                    }
-                }
-            }
-        }
-
-        let write_prefix = |out: &mut Vec<u8>, status: &str, taxid: &dyn std::fmt::Display| {
-            let header_str = unsafe { std::str::from_utf8_unchecked(&header1) };
-            if is_paired {
-                let _ = write!(out, "{}\t{}\t{}\t{}|{}\t", status, header_str, taxid, seq1.len(), seq2_len);
+        sc.runs.clear();
+        sc.run_lookup.clear();
+        sc.lookups.clear();
+        sc.spans.clear();
+        for i in g0..g1 {
+            let (_, _, s1_start, s1_end) = b1.offsets[i];
+            let r1s = sc.runs.len() as u32;
+            scan_append(ctx.scanner, &b1.data[s1_start..s1_end], sc);
+            let r1e = sc.runs.len() as u32;
+            let (r2s, r2e) = if let Some(b2) = b2 {
+                let (_, _, s2_start, s2_end) = b2.offsets[i];
+                let a = sc.runs.len() as u32;
+                scan_append(ctx.scanner, &b2.data[s2_start..s2_end], sc);
+                (a, sc.runs.len() as u32)
             } else {
-                let _ = write!(out, "{}\t{}\t{}\t{}\t", status, header_str, taxid, seq1.len());
-            }
-        };
-
-        let mut valid_hits: usize = 0;
-        let mut taxid_counts = [0u32; 256];
-        let mut target_hit_groups: usize = 0;
-        let mut bg_hit_groups: usize = 0;
-
-        let mut process_hits = |hits: &[Hit], minimizer_buf: &[u64]| {
-            let mut last_minimizer: u64 = u64::MAX;
-            for (hit, &m) in hits.iter().zip(minimizer_buf.iter()) {
-                if hit.is_hit {
-                    valid_hits += 1;
-                    taxid_counts[hit.taxid_idx as usize] += 1;
-                    if m != last_minimizer {
-                        target_hit_groups += 1;
-                        last_minimizer = m;
-                    }
-                } else if hit.bg_taxid != 0 {
-                    valid_hits += 1;
-                    if let Some(domain_idx) = db.get_taxid_index(hit.bg_taxid) {
-                        taxid_counts[domain_idx as usize] += 1;
-                    }
-                    if m != last_minimizer {
-                        bg_hit_groups += 1;
-                        last_minimizer = m;
-                    }
-                }
-            }
-        };
-        process_hits(&hits1, &minimizer_buf1); // this is for r1
-        if has_r2 {
-            process_hits(&hits2, &minimizer_buf2); // this is for r2
+                (r1e, r1e)
+            };
+            sc.spans.push((r1s, r1e, r2s, r2e));
         }
+        db.lookup_batch(&mut sc.lookups, &mut sc.lk_scratch, ctx.bg_filters);
 
-        let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, domain_penalty);
-        
-        //Unclassified
-        if valid_hits == 0 || effective_hit_groups < min_hit_groups {
-            if !no_output {
-                write_prefix(&mut local_output, "U", &0);
-                write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                if has_r2 {
-                    local_output.extend_from_slice(b" |:| ");
-                    write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
-                }
-                local_output.push(b'\n');
-            }
-            local_unclassified += 1;
-        } else {
-            let n = db.index_to_taxid.len();
+        for (gi, i) in (g0..g1).enumerate() {
+            let (r1s, r1e, r2s, r2e) = sc.spans[gi];
+            let (h1_start, h1_end, s1_start, s1_end) = b1.offsets[i];
+            let header = &b1.data[h1_start..h1_end];
+            let seq1_len = s1_end - s1_start;
+            let seq2_len = b2.map_or(0, |b| { let (_, _, s, e) = b.offsets[i]; e - s });
 
-            let mut active_indices = Vec::new();
-            for (idx, &count) in taxid_counts.iter().enumerate() {
-                if count > 0 && idx < n {
-                    active_indices.push(idx as u8);
-                }
-            }
-
-            let mut path_weights = vec![0u32; n];
-            let mut max_target_weight = 0;
-
-            for i in 0..n {
-                let mut w = 0;
-                for &j in &active_indices {
-                    // If j is an ancestor of i or vice versa, hit contribute to i's path
-                    if db.is_ancestor(j, i as u8) {
-                        w += taxid_counts[j as usize];
+            if let (Some(sb), Some(acc)) = (seen_bits, acc_for_counts) {
+                for r in (r1s as usize..r1e as usize).chain(r2s as usize..r2e as usize) {
+                    let li = sc.run_lookup[r];
+                    if li == u32::MAX {
+                        continue;
+                    }
+                    let lk = &sc.lookups[li as usize];
+                    // Helper that credits an accession-class for the very first time seen
+                    if lk.is_hit && lk.class_id != u32::MAX && sb.test_and_set(lk.dense_pos) {
+                        acc.decode_class_into(lk.class_id, &mut sc.acc_buf);
+                        let is_unique = sc.acc_buf.len() == 1;
+                        for &a in &sc.acc_buf {
+                            let slot = local_acc_counts.entry(a).or_insert((0, 0));
+                            slot.0 = slot.0.saturating_add(1);
+                            if is_unique {
+                                slot.1 = slot.1.saturating_add(1);
+                            }
+                        }
                     }
                 }
-                path_weights[i] = w;
-                if w > max_target_weight {
-                    max_target_weight = w;
+            }
+
+            let mut valid_hits: usize = 0;
+            let counts = &mut sc.taxid_counts[..];
+            counts[..n].fill(0);
+            let mut target_hit_groups: usize = 0;
+            let mut bg_hit_groups: usize = 0;
+
+            for (rs, re) in [(r1s, r1e), (r2s, r2e)] {
+                let mut last_minimizer: u64 = u64::MAX;
+                for r in rs as usize..re as usize {
+                    let li = sc.run_lookup[r];
+                    if li == u32::MAX {
+                        continue;
+                    }
+                    let (m, len) = sc.runs[r];
+                    let lk = &sc.lookups[li as usize];
+                    if lk.is_hit {
+                        valid_hits += len as usize;
+                        let ti = lk.taxid_idx as usize;
+                        if ti < n {
+                            counts[ti] += len;
+                        }
+                        if m != last_minimizer {
+                            target_hit_groups += 1;
+                            last_minimizer = m;
+                        }
+                    } else if lk.bg_taxid != 0 {
+                        valid_hits += len as usize;
+                        if let Some(di) = db.get_taxid_index(lk.bg_taxid) {
+                            counts[di as usize] += len;
+                        }
+                        if m != last_minimizer {
+                            bg_hit_groups += 1;
+                            last_minimizer = m;
+                        }
+                    }
                 }
+            }
+
+            let effective_hit_groups = target_hit_groups + apply_penalty(bg_hit_groups, ctx.domain_penalty);
+
+            //Unclassified
+            if valid_hits == 0 || effective_hit_groups < ctx.min_hit_groups {
+                if !ctx.no_output {
+                    write_prefix(&mut local_output, b"U", header);
+                    local_output.extend_from_slice(b"0");
+                    write_patterns(&mut local_output, sc, r1s, r1e, r2s, r2e, b2.is_some(), ctx, is_paired, seq1_len, seq2_len);
+                }
+                local_unclassified += 1;
+                continue;
+            }
+
+            let pw = &mut sc.path_weights[..];
+            pw[..n].fill(0);
+            let mut max_w = 0u32;
+            for j in 0..n {
+                let cj = counts[j];
+                if cj > 0 {
+                    // If j is an ancestor of i or vice versa, hit contribute to i's path
+                    for &d in &db.desc_lists[j] {
+                        let v = pw[d as usize] + cj;
+                        pw[d as usize] = v;
+                        if v > max_w {
+                            max_w = v;
+                        }
+                    }
+                }
+            }
+
+            if max_w == 0 {
+                continue;
             }
 
             // tie breaker
-            if max_target_weight > 0 {
-                let mut best_target_nodes = Vec::new();
-                for i in 0..n {
-                    if path_weights[i] == max_target_weight {
-                        best_target_nodes.push(i as u8);
+            let best = &mut sc.best;
+            best.clear();
+            for i2 in 0..n {
+                if pw[i2] == max_w {
+                    best.push(i2 as TaxIdx);
+                }
+            }
+            let nbest = best.len();
+
+            let resolved: Option<TaxIdx> = if nbest == 1 {
+                Some(best[0])
+            } else {
+                // Doing LCA here, but LCA must be an ancestor all tied nodes
+                let nw = db.mask_words;
+                let cand = &mut sc.cand[..nw];
+                cand.fill(u64::MAX);
+                for &s in best.iter() {
+                    let m = db.anc_mask(s as usize);
+                    for w in 0..nw {
+                        cand[w] &= m[w];
                     }
                 }
-
-                let mut resolved_taxid_idx: Option<u8> = None;
-
-                if best_target_nodes.len() == 1 {
-                    resolved_taxid_idx = Some(best_target_nodes[0]);
-                } else if best_target_nodes.len() > 1 {
-                    // Doing LCA here, but LCA must be an ancestor all tied nodes
-                    let mut candidate_lcas = Vec::new();
-
-                    let is_bg_on = !bg_filters.is_empty();
-
-                    for k in 0..n {
-                        let mut is_common = true;
-                        for &s in &best_target_nodes {
-                            if !db.is_ancestor(k as u8, s) {
-                                is_common = false;
-                                break;
-                            }
-                        }
-                        if is_common {
-                            if !is_bg_on {
-                                let taxid = db.true_taxid(k as u8);
-                                if matches!(taxid, TAXID_ROOT | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI | TAXID_VIRAL | TAXID_CELLULAR) {
-                                    continue;
+                if ctx.bg_filters.is_empty() {
+                    for w in 0..nw {
+                        cand[w] &= !db.domain_mask[w];
+                    }
+                }
+                let mut lca: Option<TaxIdx> = None;
+                for w in 0..nw {
+                    let mut bits = cand[w];
+                    while bits != 0 {
+                        let c = (w * 64 + bits.trailing_zeros() as usize) as TaxIdx;
+                        bits &= bits - 1;
+                        match lca {
+                            None => lca = Some(c),
+                            Some(cur) => {
+                                if db.is_ancestor(cur, c) {
+                                    lca = Some(c);
                                 }
                             }
-                            candidate_lcas.push(k as u8);
                         }
-                    }
-
-                    if !candidate_lcas.is_empty() {
-                        let mut lca_idx = candidate_lcas[0];
-                        for &c in &candidate_lcas[1..] {
-                            if db.is_ancestor(lca_idx, c) {
-                                lca_idx = c;
-                            }
-                        }
-                        resolved_taxid_idx = Some(lca_idx);
                     }
                 }
+                lca
+            };
 
+            match resolved {
                 // Classified
-                if let Some(final_idx) = resolved_taxid_idx {
+                Some(final_idx) => {
                     let best_taxid = db.true_taxid(final_idx);
-                    if !no_output {
-                        write_prefix(&mut local_output, "C", &best_taxid);
-                        write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                        if has_r2 {
-                            local_output.extend_from_slice(b" |:| ");
-                            write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
-                        }
-                        local_output.push(b'\n');
+                    if !ctx.no_output {
+                        write_prefix(&mut local_output, b"C", header);
+                        local_output.extend_from_slice(sc.itoa.format(best_taxid).as_bytes());
+                        write_patterns(&mut local_output, sc, r1s, r1e, r2s, r2e, b2.is_some(), ctx, is_paired, seq1_len, seq2_len);
                     }
-                    *local_report.entry(best_taxid).or_default() += 1;
+                    local_report[final_idx as usize] += 1;
                     local_classified += 1;
-                } else {
-                    // no LCA then it's ambiguous
-                    if !no_output {
-                        let tied_taxids_str = best_target_nodes.iter().map(|&idx| db.true_taxid(idx).to_string()).join(",");
-                        write_prefix(&mut local_output, "A", &tied_taxids_str);
-                        write_hit_pattern(&mut local_output, &hits1, db, &acc_registry);
-                        if has_r2 {
-                            local_output.extend_from_slice(b" |:| ");
-                            write_hit_pattern(&mut local_output, &hits2, db, &acc_registry);
+                }
+                // no LCA then it's ambiguous
+                None => {
+                    if !ctx.no_output {
+                        write_prefix(&mut local_output, b"A", header);
+                        for (bi, &b) in best[..nbest].iter().enumerate() {
+                            if bi > 0 {
+                                local_output.push(b',');
+                            }
+                            local_output.extend_from_slice(sc.itoa.format(db.true_taxid(b)).as_bytes());
                         }
-                        local_output.push(b'\n');
+                        write_patterns(&mut local_output, sc, r1s, r1e, r2s, r2e, b2.is_some(), ctx, is_paired, seq1_len, seq2_len);
                     }
-                    *local_report.entry(u32::MAX).or_default() += 1;
+                    local_report[n] += 1;
                     local_ambiguous += 1;
                 }
             }
         }
+        g0 = g1;
+    }
+
+    if ctx.gzip_output && !local_output.is_empty() {
+        let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(local_output.len() / 4 + 64), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &local_output).expect("gzip of in-memory buffer cannot fail");
+        local_output = enc.finish().expect("gzip of in-memory buffer cannot fail");
     }
 
     BatchResult {
@@ -564,65 +647,118 @@ fn classify_batch(
     }
 }
 
-fn write_hit_pattern(out: &mut Vec<u8>, hits: &[Hit], db: &KmerDatabase, acc_registry: &Option<AccessionRegistry>) {
-    if hits.is_empty() {
+#[inline(always)]
+fn write_prefix(out: &mut Vec<u8>, status: &[u8], header: &[u8]) {
+    out.extend_from_slice(status);
+    out.push(b'\t');
+    out.extend_from_slice(header);
+    out.push(b'\t');
+}
+
+#[inline(never)]
+fn write_patterns(
+    out: &mut Vec<u8>,
+    sc: &mut Scratch,
+    r1s: u32,
+    r1e: u32,
+    r2s: u32,
+    r2e: u32,
+    has_r2: bool,
+    ctx: &ClassifyCtx,
+    is_paired: bool,
+    len1: usize,
+    len2: usize,
+) {
+    out.push(b'\t');
+    out.extend_from_slice(sc.itoa.format(len1).as_bytes());
+    if is_paired {
+        out.push(b'|');
+        out.extend_from_slice(sc.itoa.format(len2).as_bytes());
+    }
+    out.push(b'\t');
+    write_hit_pattern(out, sc, r1s, r1e, ctx);
+    if has_r2 {
+        out.extend_from_slice(b" |:| ");
+        write_hit_pattern(out, sc, r2s, r2e, ctx);
+    }
+    out.push(b'\n');
+}
+
+#[inline(always)]
+fn write_hit_pattern(out: &mut Vec<u8>, sc: &mut Scratch, rs: u32, re: u32, ctx: &ClassifyCtx) {
+    if rs == re {
         out.extend_from_slice(b"0:0");
         return;
     }
-
-    let get_taxid = |hit: &Hit| -> u32 {
-        if hit.is_hit { db.true_taxid(hit.taxid_idx) }
-        else if hit.bg_taxid != 0 { hit.bg_taxid }
-        else { 0 }
-    };
-
-    let mut current_taxid = get_taxid(&hits[0]);
-    let mut run_len: u32 = 1;
-
-    let mut current_class_id = hits[0].accession_class_id;
-    let reg = acc_registry.as_ref();
-
-    for hit in hits.iter().skip(1) {
-        let t = get_taxid(hit);
-        if t == current_taxid {
-            run_len += 1;
+    let db = ctx.db;
+    let mut cur_taxid: u32 = 0;
+    let mut cur_class: u32 = u32::MAX;
+    let mut run_len: u32 = 0;
+    let mut first = true;
+    for r in rs as usize..re as usize {
+        let (_, len) = sc.runs[r];
+        let li = sc.run_lookup[r];
+        let (t, cls) = if li == u32::MAX {
+            (0u32, u32::MAX)
         } else {
-            emit_run(out, current_taxid, run_len, current_class_id, reg, db);
-            current_taxid = t;
-            current_class_id = hit.accession_class_id;
-            run_len = 1;
+            let lk = &sc.lookups[li as usize];
+            if lk.is_hit {
+                (db.true_taxid(lk.taxid_idx), lk.class_id)
+            } else if lk.bg_taxid != 0 {
+                (lk.bg_taxid, lk.class_id)
+            } else {
+                (0, lk.class_id)
+            }
+        };
+        if first {
+            cur_taxid = t;
+            cur_class = cls;
+            run_len = len;
+            first = false;
+        } else if t == cur_taxid {
+            run_len += len;
+        } else {
+            emit_run(out, cur_taxid, run_len, cur_class, ctx, &mut sc.acc_buf, &mut sc.itoa);
+            cur_taxid = t;
+            cur_class = cls;
+            run_len = len;
         }
     }
-    emit_run(out, current_taxid, run_len, current_class_id, reg, db);
+    emit_run(out, cur_taxid, run_len, cur_class, ctx, &mut sc.acc_buf, &mut sc.itoa);
 }
 
-#[inline]
-fn emit_run(
-    out: &mut Vec<u8>,
-    taxid: u32,
-    run_len: u32,
-    class_id: Option<u32>,
-    reg: Option<&AccessionRegistry>,
-    db: &KmerDatabase,
-) {
-    if let Some(r) = reg {
-        if taxid != 0 {
-            if let Some(cid) = class_id {
-                let accs = db.resolve_accessions(cid);
-                if !accs.is_empty() {
-                    let acc_str = accs.iter().map(|id| r.get_name(*id)).join(",");
-                    let _ = write!(out, "{}-{{{}}}:{} ", taxid, acc_str, run_len);
+#[inline(always)]
+fn emit_run(out: &mut Vec<u8>, taxid: u32, run_len: u32, class_id: u32, ctx: &ClassifyCtx, acc_buf: &mut Vec<u32>, itoa: &mut itoa::Buffer) {
+    if let Some(reg) = ctx.acc_registry {
+        if taxid != 0 && class_id != u32::MAX {
+            if let Some(acc) = ctx.db.accessions.as_ref() {
+                acc.decode_class_into(class_id, acc_buf);
+                if !acc_buf.is_empty() {
+                    out.extend_from_slice(itoa.format(taxid).as_bytes());
+                    out.extend_from_slice(b"-{");
+                    for (i, id) in acc_buf.iter().enumerate() {
+                        if i > 0 {
+                            out.push(b',');
+                        }
+                        out.extend_from_slice(reg.get_name(*id).as_bytes());
+                    }
+                    out.extend_from_slice(b"}:");
+                    out.extend_from_slice(itoa.format(run_len).as_bytes());
+                    out.push(b' ');
                     return;
                 }
             }
         }
     }
-    let _ = write!(out, "{}:{} ", taxid, run_len);
+    out.extend_from_slice(itoa.format(taxid).as_bytes());
+    out.push(b':');
+    out.extend_from_slice(itoa.format(run_len).as_bytes());
+    out.push(b' ');
 }
 
-fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
+fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool, gz_threads: usize) -> Result<()> {
     let mut r1_reader = if !gzip_multithreaded {
-        open_fastx(r1_path)?
+        open_fastx(r1_path, gz_threads)?
     } else {
         open_fastx_fast(r1_path)?
     };
@@ -635,14 +771,14 @@ fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel:
     Ok(())
 }
 
-fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
+fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool, gz_threads: usize) -> Result<()> {
     let (r2_tx, r2_rx) = crossbeam_channel::bounded::<Option<FlatBatch>>(4);
     let r2_path_owned = r2_path.to_string();
     let bs = batch_size;
 
     let r2_handle = std::thread::spawn(move || -> Result<()> {
         let mut r2_reader = if !gzip_multithreaded {
-            open_fastx(&r2_path_owned)?
+            open_fastx(&r2_path_owned, gz_threads)?
         } else {
             open_fastx_fast(&r2_path_owned)?
         };
@@ -659,7 +795,7 @@ fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &cro
     });
 
     let mut r1_reader = if !gzip_multithreaded {
-        open_fastx(r1_path)?
+        open_fastx(r1_path, gz_threads)?
     } else {
         open_fastx_fast(r1_path)?
     };
@@ -687,7 +823,15 @@ fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &cro
 }
 type FastxReader = Box<dyn needletail::FastxReader + Send>;
 
-fn open_fastx(path: &str) -> Result<FastxReader> {
+fn open_fastx(path: &str, gz_threads: usize) -> Result<FastxReader> {
+    if path.ends_with(".gz") {
+        if let Some(pgz) = crate::pgz::ParallelGzReader::open(path, gz_threads)? {
+            let buf_reader = BufReader::with_capacity(4 * 1024 * 1024, pgz);
+            let reader = needletail::parse_fastx_reader(buf_reader)
+                .map_err(|e| anyhow::anyhow!("Cannot parse reads file {}: {}", path, e))?;
+            return Ok(reader);
+        }
+    }
     let reader = needletail::parse_fastx_file(path)
         .map_err(|e| anyhow::anyhow!("Cannot open reads file {}", e))?;
     Ok(reader)
