@@ -226,30 +226,7 @@ impl QueryDb {
         };
 
         let n = index_to_taxid.len();
-        let is_anc = |a: usize, d: usize| ancestor_matrix[a * n + d] != 0;
-        let mask_words = (n + 63) / 64;
-        let mut desc_lists = vec![Vec::new(); n];
-        let mut anc_masks = vec![0u64; n * mask_words];
-        for a in 0..n {
-            for d in 0..n {
-                if is_anc(a, d) {
-                    desc_lists[a].push(d as TaxIdx);
-                    anc_masks[d * mask_words + a / 64] |= 1u64 << (a % 64);
-                }
-            }
-        }
-        let mut domain_mask = vec![0u64; mask_words];
-        let mut domain_nodes = Vec::new();
-        for (i, &t) in index_to_taxid.iter().enumerate() {
-            if matches!(t, TAXID_ROOT | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI | TAXID_VIRAL | TAXID_CELLULAR) {
-                domain_mask[i / 64] |= 1u64 << (i % 64);
-            }
-        }
-        for t in [TAXID_ROOT, TAXID_BACTERIA, TAXID_ARCHAEA, TAXID_FUNGI, TAXID_VIRAL, TAXID_CELLULAR] {
-            if let Some(p) = index_to_taxid.iter().position(|&x| x == t) {
-                domain_nodes.push((t, p as TaxIdx));
-            }
-        }
+        let (mask_words, desc_lists, anc_masks, domain_mask, domain_nodes) = derived_tables(&index_to_taxid, &ancestor_matrix);
 
         eprintln!(
             "Loaded {} minimizers, {} target taxa, {} MPHF levels in {:.2}s",
@@ -278,6 +255,71 @@ impl QueryDb {
             domain_mask,
             domain_nodes,
         })
+    }
+
+    /// Adds the domain nodes that -b hits are credited to when the index lacks them,
+    /// otherwise reads with only background hits are dropped.
+    pub fn add_domain_nodes(&mut self, domains: &[u32]) {
+        let mut wanted = vec![TAXID_ROOT, TAXID_CELLULAR, TAXID_VIRAL];
+        for &d in domains {
+            if !wanted.contains(&d) {
+                wanted.push(d);
+            }
+        }
+        let n0 = self.index_to_taxid.len();
+        let mut new_nodes: Vec<u32> = wanted.into_iter().filter(|t| !self.index_to_taxid.contains(t)).collect();
+        new_nodes.sort_unstable();
+        if !new_nodes.is_empty() {
+            let n = n0 + new_nodes.len();
+            assert!(n <= crate::database::MAX_TAXA, "too many taxa after adding domain nodes");
+            let domain_of = |t: u32| -> u32 {
+                match t {
+                    TAXID_ROOT | TAXID_CELLULAR | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI | TAXID_VIRAL => t,
+                    _ => TAXID_ROOT,
+                }
+            };
+            let is_cellular = |d: u32| matches!(d, TAXID_CELLULAR | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI);
+            let mut taxids = self.index_to_taxid.clone();
+            taxids.extend_from_slice(&new_nodes);
+            let mut anc = vec![0u8; n * n];
+            for a in 0..n {
+                for d in 0..n {
+                    anc[a * n + d] = if a < n0 && d < n0 {
+                        self.ancestor_matrix[a * n0 + d]
+                    } else if a == d {
+                        1
+                    } else if a < n0 {
+                        0
+                    } else {
+                        let ta = taxids[a];
+                        let dd = domain_of(taxids[d]);
+                        (ta == TAXID_ROOT || (ta == TAXID_CELLULAR && is_cellular(dd)) || ta == dd) as u8
+                    };
+                }
+            }
+            let names = self.names_map.get_or_insert_with(Default::default);
+            for &t in &new_nodes {
+                let nm = match t {
+                    TAXID_ROOT => "root",
+                    TAXID_CELLULAR => "cellular organisms",
+                    TAXID_BACTERIA => "Bacteria",
+                    TAXID_ARCHAEA => "Archaea",
+                    TAXID_FUNGI => "Fungi",
+                    TAXID_VIRAL => "Viruses",
+                    _ => "Unknown",
+                };
+                names.entry(t).or_insert_with(|| nm.to_string());
+            }
+            eprintln!("Added {} domain-level nodes to the taxonomy ({} taxa total)", new_nodes.len(), n);
+            self.index_to_taxid = taxids;
+            self.ancestor_matrix = anc;
+        }
+        let (mw, dl, am, dm, dn) = derived_tables(&self.index_to_taxid, &self.ancestor_matrix);
+        self.mask_words = mw;
+        self.desc_lists = dl;
+        self.anc_masks = am;
+        self.domain_mask = dm;
+        self.domain_nodes = dn;
     }
 
     #[inline(always)]
@@ -441,4 +483,32 @@ impl QueryDb {
         }
     }
 
+}
+
+fn derived_tables(index_to_taxid: &[u32], ancestor_matrix: &[u8]) -> (usize, Vec<Vec<TaxIdx>>, Vec<u64>, Vec<u64>, Vec<(u32, TaxIdx)>) {
+    let n = index_to_taxid.len();
+    let mask_words = (n + 63) / 64;
+    let mut desc_lists = vec![Vec::new(); n];
+    let mut anc_masks = vec![0u64; n * mask_words];
+    for a in 0..n {
+        for d in 0..n {
+            if ancestor_matrix[a * n + d] != 0 {
+                desc_lists[a].push(d as TaxIdx);
+                anc_masks[d * mask_words + a / 64] |= 1u64 << (a % 64);
+            }
+        }
+    }
+    let mut domain_mask = vec![0u64; mask_words];
+    let mut domain_nodes = Vec::new();
+    for (i, &t) in index_to_taxid.iter().enumerate() {
+        if matches!(t, TAXID_ROOT | TAXID_BACTERIA | TAXID_ARCHAEA | TAXID_FUNGI | TAXID_VIRAL | TAXID_CELLULAR) {
+            domain_mask[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    for t in [TAXID_ROOT, TAXID_BACTERIA, TAXID_ARCHAEA, TAXID_FUNGI, TAXID_VIRAL, TAXID_CELLULAR] {
+        if let Some(p) = index_to_taxid.iter().position(|&x| x == t) {
+            domain_nodes.push((t, p as TaxIdx));
+        }
+    }
+    (mask_words, desc_lists, anc_masks, domain_mask, domain_nodes)
 }

@@ -82,7 +82,7 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
     init_thread_pool(config.threads);
 
     let db_prefix = format!("{}/db", config.db_dir);
-    let db = QueryDb::load(&db_prefix, config.use_accessions)?;
+    let mut db = QueryDb::load(&db_prefix, config.use_accessions)?;
 
     let mut bg_filters = Vec::new();
     if config.background {
@@ -103,6 +103,11 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
                 }
             }
         }
+    }
+
+    if !bg_filters.is_empty() {
+        let domains: Vec<u32> = bg_filters.iter().map(|(_, t)| *t).collect();
+        db.add_domain_nodes(&domains);
     }
 
     let acc_path = format!("{}.accessions", db_prefix);
