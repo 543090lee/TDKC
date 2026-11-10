@@ -272,6 +272,7 @@ fn decode_task(input: &Input, task_idx: usize, tx: &Sender<Chunk>, pool: &Receiv
 pub struct ParallelGzReader {
     rx: Receiver<Chunk>,
     pool_tx: Sender<Vec<u8>>,
+    slot_tx: Sender<()>,
     input: Arc<Input>,
     pending: BTreeMap<(u64, u64), Chunk>,
     errors: BTreeMap<u64, String>,
@@ -322,6 +323,10 @@ impl ParallelGzReader {
         for _ in 0..pool_cap {
             let _ = pool_tx.try_send(Vec::new());
         }
+        let (slot_tx, slot_rx) = bounded::<()>(pool_cap);
+        for _ in 0..pool_cap {
+            let _ = slot_tx.try_send(());
+        }
         let cursor = Arc::new(AtomicUsize::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
@@ -330,6 +335,7 @@ impl ParallelGzReader {
             let cursor = cursor.clone();
             let tx = tx.clone();
             let pool_rx = pool_rx.clone();
+            let slot_rx = slot_rx.clone();
             let failed = failed.clone();
             handles.push(std::thread::spawn(move || {
                 let mut win_buf: Vec<u8> = Vec::new();
@@ -337,14 +343,14 @@ impl ParallelGzReader {
                 if failed.load(Ordering::Relaxed) {
                     break;
                 }
+                if slot_rx.recv().is_err() {
+                    break;
+                }
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= inp.tasks.len() {
                     break;
                 }
-                let data = match pool_rx.recv() {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
+                let data = take_buf(&pool_rx, 1 << 20);
                 if let Err(e) = decode_task(&inp, i, &tx, &pool_rx, data, &mut win_buf) {
                     let _ = tx.send(Chunk {
                         task_idx: i as u64,
@@ -360,9 +366,11 @@ impl ParallelGzReader {
         }
         drop(tx);
         drop(pool_rx);
+        drop(slot_rx);
         Ok(Some(Self {
             rx,
             pool_tx,
+            slot_tx,
             input,
             pending: BTreeMap::new(),
             errors: BTreeMap::new(),
@@ -380,6 +388,7 @@ impl ParallelGzReader {
         loop {
             if let Some(c) = self.pending.remove(&(self.cur_task, self.cur_seq)) {
                 if c.last {
+                    let _ = self.slot_tx.try_send(());
                     let next_pos = c.actual_end;
                     if next_pos >= self.input.file_len {
                         self.eof = true;
@@ -397,12 +406,16 @@ impl ParallelGzReader {
                         let stale: Vec<(u64, u64)> = self.pending.range(..(self.cur_task, 0)).map(|(k, _)| *k).collect();
                         for k in stale {
                             if let Some(c) = self.pending.remove(&k) {
+                                if c.last {
+                                    let _ = self.slot_tx.try_send(());
+                                }
                                 let _ = self.pool_tx.try_send(c.data);
                             }
                         }
                         let stale_err: Vec<u64> = self.errors.range(..self.cur_task).map(|(k, _)| *k).collect();
                         for k in stale_err {
                             self.errors.remove(&k);
+                            let _ = self.slot_tx.try_send(());
                         }
                     }
                 } else {
@@ -426,6 +439,9 @@ impl ParallelGzReader {
             match self.rx.recv() {
                 Ok(c) => {
                     if c.task_idx < self.cur_task {
+                        if c.last {
+                            let _ = self.slot_tx.try_send(());
+                        }
                         let _ = self.pool_tx.try_send(c.data);
                         continue;
                     }
@@ -471,6 +487,8 @@ impl Drop for ParallelGzReader {
         drop(rx);
         let pool_tx = std::mem::replace(&mut self.pool_tx, bounded(1).0);
         drop(pool_tx);
+        let slot_tx = std::mem::replace(&mut self.slot_tx, bounded(1).0);
+        drop(slot_tx);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
