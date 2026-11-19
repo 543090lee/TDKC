@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use crate::taxonomy::{load_target_taxids, TargetTaxIDManager, TaxonomyTree};
 use rustc_hash::FxHashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use download::*;
 use pipeline::*;
 
@@ -49,6 +49,8 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         .await
         .context("Failed to create output genome directory")?;
 
+    let new_targets = std::fs::read(&cfg.targets_file).context("Cannot read targets file")?;
+    let old_targets = std::fs::read(out_dir.join("targets.txt")).unwrap_or_default();
     tokio::fs::copy(&cfg.targets_file, out_dir.join("targets.txt"))
         .await
         .context("Failed to copy targets file into db dir")?;
@@ -86,8 +88,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
 
     for domain in &domain_list {
         let done_marker = genome_dir.join(format!(".{}.done", domain));
-        if done_marker.exists() {
-            eprintln!("\nDomain '{}' already exists, skipping.", domain);
+        if reuse_done(&genome_dir, domain, &old_targets, &new_targets, &relevant_taxids)? {
             continue;
         }
 
@@ -183,16 +184,14 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
         total_stats.records_in_target += stats.records_in_target;
         total_stats.chunks_masked += stats.chunks_masked;
 
-        tokio::fs::write(&done_marker, b"")
+        tokio::fs::write(&done_marker, &new_targets)
             .await
             .with_context(|| format!("write done marker {}", done_marker.display()))?;
     }
 
     if let Some(custom_path) = &cfg.custom_fasta {
         let done_marker = genome_dir.join(".custom.done");
-        if done_marker.exists() {
-            eprintln!("\nCustom sequences already added, skipping.");
-        } else {
+        if !reuse_done(&genome_dir, "custom", &old_targets, &new_targets, &relevant_taxids)? {
             eprintln!("\nProcessing custom FASTA: {}", custom_path);
 
             let mut wanted = std::collections::HashSet::new();
@@ -239,7 +238,7 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
             total_stats.genomes_processed += stats.genomes_processed;
             total_stats.records_in_target += stats.records_in_target;
 
-            tokio::fs::write(&done_marker, b"")
+            tokio::fs::write(&done_marker, &new_targets)
                 .await
                 .with_context(|| format!("write done marker {}", done_marker.display()))?;
         }
@@ -250,6 +249,52 @@ pub async fn run_prep(cfg: PrepConfig) -> Result<()> {
     eprintln!("Prep is done!");
     eprintln!("Total target accessions: {}", total_stats.records_in_target);
     Ok(())
+}
+
+// Returns true when a domain is already on disk. Its target sequences depend on the targets file,
+// so when that changed they are split out again from the genome already downloaded.
+fn reuse_done(
+    genome_dir: &std::path::Path,
+    name: &str,
+    old_targets: &[u8],
+    new_targets: &[u8],
+    relevant: &std::collections::HashSet<u32>,
+) -> Result<bool> {
+    let marker = genome_dir.join(format!(".{}.done", name));
+    let Ok(mut made_with) = std::fs::read(&marker) else { return Ok(false) };
+    if made_with.is_empty() {
+        // Older versions wrote an empty marker; that domain was split with the previous targets.txt
+        made_with = old_targets.to_vec();
+    }
+    if made_with == new_targets {
+        eprintln!("\nDomain '{}' already exists, skipping.", name);
+        return Ok(true);
+    }
+
+    eprintln!("\nDomain '{}' already exists but the targets changed, re-splitting its target sequences.", name);
+    let taxids = load_prelim_map(&genome_dir.join(format!("_prelim.{}.txt", name)).to_string_lossy())?;
+    let fna = genome_dir.join(format!("{}.fna", name));
+    let reader = BufReader::with_capacity(8 << 20, File::open(&fna).with_context(|| format!("Cannot open {}", fna.display()))?);
+    let tmp = genome_dir.join(format!("_target.{}.fna.tmp", name));
+    let mut w = BufWriter::with_capacity(8 << 20, File::create(&tmp)?);
+    let mut keep = false;
+    for line in reader.split(b'\n') {
+        let line = line?;
+        if line.first() == Some(&b'>') {
+            keep = std::str::from_utf8(&line[1..]).ok()
+                .and_then(|h| h.split_whitespace().next())
+                .and_then(|id| taxids.get(id))
+                .is_some_and(|t| relevant.contains(t));
+        }
+        if keep {
+            w.write_all(&line)?;
+            w.write_all(b"\n")?;
+        }
+    }
+    w.flush()?;
+    std::fs::rename(&tmp, genome_dir.join(format!("_target.{}.fna", name)))?;
+    std::fs::write(&marker, new_targets)?;
+    Ok(true)
 }
 
 pub fn load_prelim_map(path: &str) -> Result<FxHashMap<String, u32>> {
