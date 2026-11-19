@@ -113,6 +113,7 @@ You can find an example `targets.txt` in the `data/` directory of this repo. The
 | `-k` | `35` | Window size k |
 | `-l` | `31` | Minimizer length l |
 | `-a` | off | Enable accession tracking |
+| `--fingerprint` | `16` | Fingerprint bits per minimizer (`16` or `32`). Recommend 32 if classification is run on a surveillance scale |
 
 ---
 

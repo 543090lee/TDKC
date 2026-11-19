@@ -134,6 +134,8 @@ pub struct QueryDb {
     mphf: FastMphf,
     fptax: Vec<u8>,
     stride: usize,
+    fw: usize,
+    fp_mask: u32,
     pub index_to_taxid: Vec<u32>,
     pub ancestor_matrix: Vec<u8>,
     pub accessions: Option<AccIndex>,
@@ -165,12 +167,10 @@ impl QueryDb {
         let fptax = {
             let ffp = File::open(format!("{}.fp", prefix)).context("Cannot open .fp file")?;
             let ftx = File::open(format!("{}.taxid", prefix)).context("Cannot open .taxid file")?;
-            if (ffp.metadata()?.len() as usize) < num_minimizers * 2 {
-                bail!(".fp file is shorter than expected");
-            }
+            let fw = crate::database::infer_fp_width(ffp.metadata()?.len(), num_minimizers)?;
             let tw = crate::database::infer_taxid_width(ftx.metadata()?.len(), num_minimizers)?;
             crate::database::check_taxid_width(meta_width, tw)?;
-            let stride = 2 + tw;
+            let stride = fw + tw;
             let mut out: Vec<u8> = Vec::with_capacity(num_minimizers * stride + 8);
             unsafe { out.set_len(num_minimizers * stride) };
             const CH: usize = 1 << 20;
@@ -178,9 +178,9 @@ impl QueryDb {
             out.par_chunks_mut(CH * stride).enumerate().for_each(|(ci, dst)| {
                 let base = ci * CH;
                 let n = dst.len() / stride;
-                let mut fp = vec![0u8; n * 2];
+                let mut fp = vec![0u8; n * fw];
                 let mut tx = vec![0u8; n * tw];
-                let r1 = crate::pgz::read_at(&ffp, &mut fp, (base * 2) as u64);
+                let r1 = crate::pgz::read_at(&ffp, &mut fp, (base * fw) as u64);
                 let r2 = crate::pgz::read_at(&ftx, &mut tx, (base * tw) as u64);
                 if let Err(e) = r1.and(r2) {
                     *err.lock().unwrap() = Some(e);
@@ -188,11 +188,10 @@ impl QueryDb {
                 }
                 for i in 0..n {
                     let o = i * stride;
-                    dst[o] = fp[i * 2];
-                    dst[o + 1] = fp[i * 2 + 1];
-                    dst[o + 2] = tx[i * tw];
+                    dst[o..o + fw].copy_from_slice(&fp[i * fw..(i + 1) * fw]);
+                    dst[o + fw] = tx[i * tw];
                     if tw == 2 {
-                        dst[o + 3] = tx[i * 2 + 1];
+                        dst[o + fw + 1] = tx[i * 2 + 1];
                     }
                 }
             });
@@ -204,15 +203,15 @@ impl QueryDb {
             unsafe {
                 libc::madvise(out.as_mut_ptr() as *mut libc::c_void, out.len(), libc::MADV_HUGEPAGE);
             }
-            (out, stride)
+            (out, stride, fw)
         };
-        let (fptax, stride) = fptax;
+        let (fptax, stride, fw) = fptax;
 
         let (index_to_taxid, ancestor_matrix) = read_taxmap(prefix)?;
         if index_to_taxid.len() > crate::database::MAX_TAXA {
             bail!("database has {} target taxa; the taxid index supports at most {}", index_to_taxid.len(), crate::database::MAX_TAXA);
         }
-        if stride == 3 && index_to_taxid.len() > 256 {
+        if stride - fw == 1 && index_to_taxid.len() > 256 {
             bail!(".taxid is 1 byte per minimizer but .taxmap lists {} taxa", index_to_taxid.len());
         }
 
@@ -245,6 +244,8 @@ impl QueryDb {
             mphf,
             fptax,
             stride,
+            fw,
+            fp_mask: if fw == 4 { u32::MAX } else { 0xFFFF },
             index_to_taxid,
             ancestor_matrix,
             accessions,
@@ -428,14 +429,16 @@ impl QueryDb {
                 let idx = s.idx as usize;
                 if idx < self.num_minimizers {
                     let p = idx * self.stride;
-                    let fp = u16::from_le_bytes([self.fptax[p], self.fptax[p + 1]]);
-                    if fp == compute_fingerprint(s.key) {
+                    // The 8 padding bytes after the last entry keep this 4-byte read in bounds
+                    let fp = u32::from_le_bytes([self.fptax[p], self.fptax[p + 1], self.fptax[p + 2], self.fptax[p + 3]]);
+                    if (fp ^ compute_fingerprint(s.key)) & self.fp_mask == 0 {
                         s.state = ST_HIT;
                         s.is_hit = true;
-                        s.taxid_idx = if self.stride == 3 {
-                            self.fptax[p + 2] as TaxIdx
+                        let t = p + self.fw;
+                        s.taxid_idx = if self.stride - self.fw == 1 {
+                            self.fptax[t] as TaxIdx
                         } else {
-                            u16::from_le_bytes([self.fptax[p + 2], self.fptax[p + 3]])
+                            u16::from_le_bytes([self.fptax[t], self.fptax[t + 1]])
                         };
                         if let Some(a) = acc {
                             if let Some(dp) = a.dense_pos(idx) {

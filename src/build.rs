@@ -25,6 +25,7 @@ pub struct BuildConfig {
     pub k: usize,
     pub l: usize,
     pub names_dmp_path: String,
+    pub fp_width: usize,
 }
 
 const NUM_SHARDS: usize = 256;
@@ -154,6 +155,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         spaced_seed_mask,
         TOGGLE_MASK,
         config.track_accessions,
+        config.fp_width,
     )?;
 
     let phase = Instant::now();
@@ -182,6 +184,7 @@ fn build_database_from_shards(
     spaced_seed_mask: u64,
     toggle_mask: u64,
     track_accessions: bool,
+    fp_width: usize,
 ) -> Result<KmerDatabase> {
     let start = Instant::now();
     eprintln!("\nBuilding k-mer database");
@@ -265,7 +268,7 @@ fn build_database_from_shards(
 
     eprintln!("\nPopulating arrays...");
     let phase = Instant::now();
-    let mut fingerprints = vec![0u16; num_minimizers];
+    let mut fingerprints = vec![0u32; num_minimizers];
     let mut taxid_indices: Vec<TaxIdx> = vec![0; num_minimizers];
     let mut accessions = track_accessions
         .then(|| EqClassAccessions::new_empty(num_minimizers));
@@ -342,6 +345,7 @@ fn build_database_from_shards(
         num_minimizers,
         mphf,
         fingerprints,
+        fp_width,
         taxid_indices,
         index_to_taxid,
         ancestor_matrix,

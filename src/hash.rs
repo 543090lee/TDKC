@@ -2,11 +2,12 @@ use std::hash::{BuildHasher, Hasher};
 use rustc_hash::FxHasher;
 
 #[inline]
-pub fn compute_fingerprint(mut kmer: u64) -> u16 {
+pub fn compute_fingerprint(mut kmer: u64) -> u32 {
     kmer ^= kmer >> 33;
     kmer = kmer.wrapping_mul(0xff51afd7ed558ccd);
     kmer ^= kmer >> 33;
-    (kmer & 0xFFFF) as u16
+    // The low 16 bits are the fingerprint of a 16-bit database, all 32 of a 32-bit one
+    kmer as u32
 }
 
 #[inline]

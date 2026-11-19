@@ -72,6 +72,10 @@ enum Commands {
         #[arg(short = 'a', long)]
         accession: bool,
 
+        #[arg(long, default_value = "16", value_parser = ["16", "32"],
+              help = "fingerprint bits per minimizer; 32 lowers the false hit rate from 1 in 65,536 to 1 in 4.3 billion and costs 2 more bytes per minimizer")]
+        fingerprint: String,
+
     },
 
     Query {
@@ -185,6 +189,7 @@ fn main() -> anyhow::Result<()> {
             accession,
             window_size,
             minimizer_size,
+            fingerprint,
         } => {
             let db_path = std::path::PathBuf::from(&db);
             let genome_dir = db_path.join("genome");
@@ -219,6 +224,7 @@ fn main() -> anyhow::Result<()> {
                 track_accessions: accession,
                 k: window_size,
                 l: minimizer_size,
+                fp_width: fingerprint.parse::<usize>()? / 8,
             })?;
         }
 

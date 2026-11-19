@@ -301,7 +301,8 @@ pub struct KmerDatabase {
     pub toggle_mask: u64,
     num_minimizers: usize,
     mphf: Mphf<u64>,
-    fingerprints: Vec<u16>,
+    fingerprints: Vec<u32>,
+    fp_width: usize,
     taxid_indices: Vec<TaxIdx>,
     pub index_to_taxid: Vec<u32>,
     pub ancestor_matrix: Vec<u8>,
@@ -319,7 +320,8 @@ impl KmerDatabase {
         toggle_mask: u64,
         num_minimizers: usize,
         mphf: Mphf<u64>,
-        fingerprints: Vec<u16>,
+        fingerprints: Vec<u32>,
+        fp_width: usize,
         taxid_indices: Vec<TaxIdx>,
         index_to_taxid: Vec<u32>,
         ancestor_matrix: Vec<u8>,
@@ -328,7 +330,7 @@ impl KmerDatabase {
     ) -> Self {
         Self {
             k, l, spaced_seed_mask, toggle_mask,
-            num_minimizers, mphf, fingerprints, taxid_indices,
+            num_minimizers, mphf, fingerprints, fp_width, taxid_indices,
             index_to_taxid, ancestor_matrix, accessions, names_map
         }
     }
@@ -375,13 +377,9 @@ impl KmerDatabase {
         // .fp
         {
             let mut w = BufWriter::new(File::create(format!("{}.fp", prefix))?);
-            let fp_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.fingerprints.as_ptr() as *const u8,
-                    self.fingerprints.len() * 2,
-                )
-            };
-            w.write_all(fp_bytes)?;
+            for &fp in &self.fingerprints {
+                w.write_all(&fp.to_le_bytes()[..self.fp_width])?;
+            }
             w.flush()?;
         }
         {
@@ -439,13 +437,17 @@ impl KmerDatabase {
         // .fp
         let fingerprints = {
             let mut f = File::open(format!("{}.fp", prefix)).context("Cannot open .fp file")?;
-            let mut fp = vec![0u16; num_minimizers];
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(fp.as_mut_ptr() as *mut u8, num_minimizers * 2)
-            };
-            f.read_exact(byte_slice)?;
-            fp
+            let width = infer_fp_width(f.metadata()?.len(), num_minimizers)?;
+            let mut raw = vec![0u8; num_minimizers * width];
+            f.read_exact(&mut raw)?;
+            let fp: Vec<u32> = raw.chunks_exact(width).map(|c| {
+                let mut b = [0u8; 4];
+                b[..width].copy_from_slice(c);
+                u32::from_le_bytes(b)
+            }).collect();
+            (fp, width)
         };
+        let (fingerprints, fp_width) = fingerprints;
 
         let taxid_indices = {
             let mut f = File::open(format!("{}.taxid", prefix)).context("Cannot open .taxid file")?;
@@ -471,7 +473,7 @@ impl KmerDatabase {
         };
         Ok(Self {
             k, l, spaced_seed_mask, toggle_mask, num_minimizers,
-            mphf, fingerprints, taxid_indices, index_to_taxid, ancestor_matrix, accessions, names_map, 
+            mphf, fingerprints, fp_width, taxid_indices, index_to_taxid, ancestor_matrix, accessions, names_map,
         })
     }
 }
@@ -560,6 +562,13 @@ pub fn check_taxid_width(meta_width: usize, file_width: usize) -> Result<()> {
         anyhow::bail!(".meta says {} byte(s) per taxid but .taxid size implies {}", meta_width, file_width);
     }
     Ok(())
+}
+
+pub fn infer_fp_width(file_len: u64, num_minimizers: usize) -> Result<usize> {
+    let n = num_minimizers as u64;
+    if file_len == n * 2 { Ok(2) }
+    else if file_len == n * 4 { Ok(4) }
+    else { anyhow::bail!(".fp length {} is neither {} nor {} bytes (num_minimizers={})", file_len, n * 2, n * 4, n) }
 }
 
 pub fn infer_taxid_width(file_len: u64, num_minimizers: usize) -> Result<usize> {
